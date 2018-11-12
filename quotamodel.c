@@ -18,6 +18,7 @@
 #include "access/htup_details.h"
 #include "access/reloptions.h"
 #include "access/transam.h"
+#include "access/tupdesc.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_class.h"
@@ -175,7 +176,7 @@ disk_quota_shmem_startup(void)
 
 	if (!found)
 	{
-		black_map_shm_lock->lock = &(GetNamedLWLockTranche("disk_quota_black_map_shm_lock"))->lock;
+		black_map_shm_lock->lock = LWLockAssign();
 	}
 
 	init_lock_active_tables();
@@ -205,8 +206,6 @@ init_disk_quota_shmem(void)
 	 * resources in pgss_shmem_startup().
 	 */
 	RequestAddinShmemSpace(DiskQuotaShmemSize());
-	RequestNamedLWLockTranche("disk_quota_black_map_shm_lock", 1);
-	RequestNamedLWLockTranche("disk_quota_active_table_shm_lock", 1);
 
 	/*
 	 * Install startup hook to initialize our shared memory.
@@ -294,7 +293,7 @@ init_disk_quota_model(void)
 void
 refresh_disk_quota_model(bool force)
 {
-	elog(DEBUG1,"check disk quota begin");
+	elog(LOG,"check disk quota begin");
 	StartTransactionCommand();
 	SPI_connect();
 	PushActiveSnapshot(GetTransactionSnapshot());
@@ -306,7 +305,7 @@ refresh_disk_quota_model(bool force)
 	SPI_finish();
 	PopActiveSnapshot();
 	CommitTransactionCommand();
-	elog(DEBUG1,"check disk quota end");
+	elog(LOG,"check disk quota end");
 }
 
 /*
@@ -459,7 +458,7 @@ static void check_disk_quota_by_oid(Oid targetOid, int64 current_usage, QuotaTyp
 		keyitem.targetoid = targetOid;
 		keyitem.databaseoid = MyDatabaseId;
 		keyitem.targettype = (uint32)type;
-		elog(DEBUG1,"Put object %u to blacklist with quota limit:%d, current usage:%d",
+		elog(LOG,"Put object %u to blacklist with quota limit:%d, current usage:%d",
 				targetOid, quota_limit_mb, current_usage_mb);
 		localblackentry = (LocalBlackMapEntry*) hash_search(local_disk_quota_black_map,
 					&keyitem,
@@ -772,9 +771,9 @@ load_quotas(void)
 
 	tupdesc = SPI_tuptable->tupdesc;
 	if (tupdesc->natts != 3 ||
-		TupleDescAttr(tupdesc, 0)->atttypid != OIDOID ||
-		TupleDescAttr(tupdesc, 1)->atttypid != INT4OID ||
-		TupleDescAttr(tupdesc, 2)->atttypid != INT8OID)
+		((tupdesc)->attrs[0])->atttypid != OIDOID ||
+		((tupdesc)->attrs[1])->atttypid != INT4OID ||
+		((tupdesc)->attrs[2])->atttypid != INT8OID)
 	{
 		elog(LOG, "configuration table \"quota_config\" is corruptted in database \"%s\"," 
 				" please recreate diskquota extension",
@@ -889,7 +888,7 @@ quota_check_common(Oid reloid)
 		{
 			ereport(ERROR,
 					(errcode(ERRCODE_DISK_FULL),
-					 errmsg("role's disk space quota exceeded with name:%s", GetUserNameFromId(ownerOid, false))));
+					 errmsg("role's disk space quota exceeded with name:%s", GetUserNameFromId(ownerOid))));
 			return false;
 		}
 	}

@@ -81,7 +81,7 @@ void init_lock_active_tables(void)
 
 	if (!found)
 	{
-		active_table_shm_lock->lock = &(GetNamedLWLockTranche("disk_quota_active_table_shm_lock"))->lock;
+		active_table_shm_lock->lock = LWLockAssign();
 	}
 }
 

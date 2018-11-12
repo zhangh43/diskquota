@@ -16,18 +16,23 @@
  */
 #include "postgres.h"
 
+#include <unistd.h>
+
 #include "catalog/namespace.h"
 #include "catalog/pg_collation.h"
+#include "cdb/cdbvars.h"
 #include "executor/spi.h"
+#include "libpq/libpq-be.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "postmaster/bgworker.h"
 #include "storage/ipc.h"
+#include "storage/proc.h"
 #include "tcop/utility.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/formatting.h"
 #include "utils/numeric.h"
-#include "utils/varlena.h"
 
 #include "activetable.h"
 #include "diskquota.h"
@@ -128,6 +133,12 @@ _PG_init(void)
 							NULL,
 							NULL);
 
+	/* start disk quota launcher only on master */
+	if (Gp_role != GP_ROLE_DISPATCH) 
+	{
+		return ;
+	}
+
 	/* set up common data for diskquota launcher worker */
 	worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
 		BGWORKER_BACKEND_DATABASE_CONNECTION;
@@ -193,7 +204,6 @@ disk_quota_worker_main(Datum main_arg)
 {
 	char *dbname=MyBgworkerEntry->bgw_name;
 	elog(LOG,"start disk quota worker process to monitor database:%s", dbname);
-
 	/* Establish signal handlers before unblocking signals. */
 	pqsignal(SIGHUP, disk_quota_sighup);
 	pqsignal(SIGTERM, disk_quota_sigterm);
@@ -202,7 +212,7 @@ disk_quota_worker_main(Datum main_arg)
 	BackgroundWorkerUnblockSignals();
 
 	/* Connect to our database */
-	BackgroundWorkerInitializeConnection(dbname, NULL, 0);
+	BackgroundWorkerInitializeConnection(dbname, NULL);
 
 	/* Initialize diskquota related local hash map and refresh model immediately*/
 	init_disk_quota_model();
@@ -223,7 +233,7 @@ disk_quota_worker_main(Datum main_arg)
 		 */
 		rc = WaitLatch(&MyProc->procLatch,
 					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
-					   diskquota_naptime * 1000L, PG_WAIT_EXTENSION);
+					   diskquota_naptime * 1000L);
 		ResetLatch(&MyProc->procLatch);
 
 		/* Do the work */
@@ -279,7 +289,7 @@ disk_quota_launcher_main(Datum main_arg)
 										  HASH_ELEM);
 
 	dblist = get_database_list();
-
+	elog(LOG,"diskquota launcher started");
 	foreach(cell, dblist)
 	{
 		char *db_name;
@@ -310,7 +320,7 @@ disk_quota_launcher_main(Datum main_arg)
 		 */
 		rc = WaitLatch(&MyProc->procLatch,
 						WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
-						diskquota_naptime * 1000L, PG_WAIT_EXTENSION);
+						diskquota_naptime * 1000L);
 		ResetLatch(&MyProc->procLatch);
 
 		/* emergency bailout if postmaster has died */
@@ -468,6 +478,7 @@ start_worker(char* dbname)
 	bool found;
 	DiskQuotaWorkerEntry* workerentry;
 
+	memset(&worker, 0, sizeof(BackgroundWorker));
 	worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
 		BGWORKER_BACKEND_DATABASE_CONNECTION;
 	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
@@ -477,12 +488,11 @@ start_worker(char* dbname)
 	snprintf(worker.bgw_name, BGW_MAXLEN, "%s", dbname);
 	/* set bgw_notify_pid so that we can use WaitForBackgroundWorkerStartup */
 	worker.bgw_notify_pid = MyProcPid;
+	worker.bgw_main_arg = (Datum) 0;
 
 	if (!RegisterDynamicBackgroundWorker(&worker, &handle))
 		return -1;
-
 	status = WaitForBackgroundWorkerStartup(handle, &pid);
-
 	if (status == BGWH_STOPPED)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
@@ -493,6 +503,7 @@ start_worker(char* dbname)
 				(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
 			  errmsg("cannot start background processes without postmaster"),
 				 errhint("Kill all remaining database processes and restart the database.")));
+
 	Assert(status == BGWH_STARTED);
 
 	/* put the worker handle into the worker map */
