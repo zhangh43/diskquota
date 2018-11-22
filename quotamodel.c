@@ -7,8 +7,6 @@
  *
  * Copyright (C) 2013, PostgreSQL Global Development Group
  *
- * IDENTIFICATION
- *		contrib/diskquota/quotamodel.c
  *
  * -------------------------------------------------------------------------
  */
@@ -124,7 +122,6 @@ static void calculate_table_disk_usage(bool force);
 static void calculate_schema_disk_usage(void);
 static void calculate_role_disk_usage(void);
 static void flush_local_black_map(void);
-static void reset_local_black_map(void);
 static void check_disk_quota_by_oid(Oid targetOid, int64 current_usage, QuotaType type);
 static void update_namespace_map(Oid namespaceoid, int64 updatesize);
 static void update_role_map(Oid owneroid, int64 updatesize);
@@ -231,7 +228,7 @@ init_disk_quota_model(void)
 	hash_ctl.hash = oid_hash;
 
 	table_size_map = hash_create("TableSizeEntry map",
-								1024,
+								1024 * 8,
 								&hash_ctl,
 								HASH_ELEM | HASH_CONTEXT | HASH_FUNCTION);
 
@@ -316,8 +313,6 @@ refresh_disk_quota_model(bool force)
 static void
 refresh_disk_quota_usage(bool force)
 {
-	/* copy shared black map to local black map */
-	reset_local_black_map();
 	/* recalculate the disk usage of table, schema and role */
 	calculate_table_disk_usage(force);
 	calculate_schema_disk_usage();
@@ -363,6 +358,7 @@ flush_local_black_map(void)
 					blackentry->targettype = localblackentry->keyitem.targettype;
 				}
 			}
+			localblackentry->isexceeded = false;
 		}
 		else
 		{
@@ -370,48 +366,12 @@ flush_local_black_map(void)
 			(void) hash_search(disk_quota_black_map,
 							   (void *) &localblackentry->keyitem,
 							   HASH_REMOVE, NULL);
+			(void) hash_search(local_disk_quota_black_map,
+							   (void *) &localblackentry->keyitem,
+							   HASH_REMOVE, NULL);
 		}
 	}
 	LWLockRelease(black_map_shm_lock->lock);
-}
-
-/* Fetch the new blacklist from shared blacklist at each refresh iteration. */
-static void
-reset_local_black_map(void)
-{
-	HASH_SEQ_STATUS iter;
-	LocalBlackMapEntry* localblackentry;
-	BlackMapEntry* blackentry;
-	bool found;
-	/* clear entries in local black map*/
-	hash_seq_init(&iter, local_disk_quota_black_map);
-
-	while ((localblackentry = hash_seq_search(&iter)) != NULL)
-	{
-		(void) hash_search(local_disk_quota_black_map,
-				(void *) &localblackentry->keyitem,
-				HASH_REMOVE, NULL);
-	}
-
-	/* get black map copy from shared black map */
-	LWLockAcquire(black_map_shm_lock->lock, LW_SHARED);
-	hash_seq_init(&iter, disk_quota_black_map);
-	while ((blackentry = hash_seq_search(&iter)) != NULL)
-	{
-		/* only reset entries for current db */
-		if (blackentry->databaseoid == MyDatabaseId)
-		{
-			localblackentry = (LocalBlackMapEntry*) hash_search(local_disk_quota_black_map,
-								(void *) blackentry,
-								HASH_ENTER, &found);
-			if (!found)
-			{
-				localblackentry->isexceeded = false;
-			}
-		}
-	}
-	LWLockRelease(black_map_shm_lock->lock);
-
 }
 
 /*
@@ -549,11 +509,11 @@ static void
 calculate_table_disk_usage(bool force)
 {
 	bool found;
-	bool active_tbl_found;
+	bool active_tbl_found = false;
 	Relation	classRel;
 	HeapTuple	tuple;
 	HeapScanDesc relScan;
-	TableSizeEntry *tsentry;
+	TableSizeEntry *tsentry = NULL;
 	Oid			relOid;
 	HASH_SEQ_STATUS iter;
 	HTAB *local_active_table_stat_map;
