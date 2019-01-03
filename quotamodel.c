@@ -136,9 +136,11 @@ static void update_role_map(Oid owneroid, int64 updatesize);
 static void remove_namespace_map(Oid namespaceoid);
 static void remove_role_map(Oid owneroid);
 static bool load_quotas(void);
+static bool do_check_diskquota_state_is_ready(void);
 
 static Size DiskQuotaShmemSize(void);
 static void disk_quota_shmem_startup(void);
+
 
 /*
  * DiskQuotaShmemSize
@@ -288,11 +290,8 @@ init_disk_quota_model(void)
 											 HASH_ELEM | HASH_CONTEXT | HASH_FUNCTION);
 }
 
-/*
- * Load table size info from diskquota.table_size table.
-*/
-bool
-check_diskquota_state_is_ready(void)
+static bool
+do_check_diskquota_state_is_ready(void)
 {
 	int			ret;
 	TupleDesc	tupdesc;
@@ -300,10 +299,6 @@ check_diskquota_state_is_ready(void)
 
 	RangeVar   *rv;
 	Relation	rel;
-
-	StartTransactionCommand();
-	SPI_connect();
-	PushActiveSnapshot(GetTransactionSnapshot());
 
 	/* check table diskquota.state exists*/
 	rv = makeRangeVar("diskquota", "state", -1);
@@ -350,12 +345,30 @@ check_diskquota_state_is_ready(void)
 			return true;
 		}
 	}
-	SPI_finish();
-	PopActiveSnapshot();
-	CommitTransactionCommand();
 	ereport(LOG, (errmsg("Diskquota is not in ready state. "
 			"please run UDF init_table_size_table()")));
 	return false;
+}
+
+/*
+ * Load table size info from diskquota.table_size table.
+*/
+bool
+check_diskquota_state_is_ready(void)
+{
+	bool ret;
+
+	StartTransactionCommand();
+	SPI_connect();
+	PushActiveSnapshot(GetTransactionSnapshot());
+
+	ret = do_check_diskquota_state_is_ready();
+
+	SPI_finish();
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+
+	return ret;
 }
 
 /*
