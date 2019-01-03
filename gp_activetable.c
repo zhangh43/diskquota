@@ -21,11 +21,13 @@
 #include "cdb/cdbdisp_query.h"
 #include "cdb/cdbdispatchresult.h"
 #include "cdb/cdbvars.h"
+#include "commands/dbcommands.h"
 #include "executor/spi.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "libpq-fe.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
 #include "storage/shmem.h"
 #include "storage/smgr.h"
 #include "utils/array.h"
@@ -73,7 +75,7 @@ static StringInfoData convert_map_to_string(HTAB *active_list);
 static HTAB *pull_active_list_from_seg(void);
 static void report_active_table_SmgrStat(SMgrRelation reln);
 static void report_active_table_AO(BufferedAppend * bufferedAppend);
-static bool load_table_size(void);
+static bool load_table_size(HTAB	 *local_table_stats_map);
 
 void		init_active_table_hook(void);
 void		init_shm_worker_active_tables(void);
@@ -596,7 +598,7 @@ get_active_tables(void)
  * Load table size info from diskquota.table_size table.
 */
 static bool
-load_table_size(void)
+load_table_size(HTAB	 *local_table_stats_map)
 {
 	int			ret;
 	TupleDesc	tupdesc;
@@ -699,7 +701,7 @@ gp_fetch_active_tables(bool is_init)
 
 	if (is_init)
 	{
-		load_table_size();
+		load_table_size(local_table_stats_map);
 	}
 	else
 	{
