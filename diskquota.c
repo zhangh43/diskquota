@@ -82,7 +82,6 @@ static int64 get_size_in_mb(char *str);
 static void refresh_worker_list(void);
 static void set_quota_internal(Oid targetoid, int64 quota_limit_mb, QuotaType type);
 static int	start_worker(char *dbname);
-static bool check_diskquota_state_is_ready(void);
 
 /*
  * Entrypoint of diskquota module.
@@ -389,69 +388,6 @@ disk_quota_launcher_main(Datum main_arg)
 }
 
 /*
- * Load table size info from diskquota.table_size table.
-*/
-static bool
-check_diskquota_state_is_ready(void)
-{
-	int			ret;
-	TupleDesc	tupdesc;
-	int			i;
-
-	RangeVar   *rv;
-	Relation	rel;
-
-	/* check table diskquota.state exists*/
-	rv = makeRangeVar("diskquota", "state", -1);
-	rel = heap_openrv_extended(rv, AccessShareLock, true);
-	if (!rel)
-	{
-		/* configuration table is missing. */
-		elog(LOG, "table \"diskquota.state\" is missing in database \"%s\","
-			 " please recreate diskquota extension",
-			 get_database_name(MyDatabaseId));
-		return false;
-	}
-	heap_close(rel, NoLock);
-
-	/* check diskquota state from table diskquota.state */
-	ret = SPI_execute("select state from diskquota.state", true, 0);
-	if (ret != SPI_OK_SELECT)
-		elog(FATAL, "SPI_execute failed: error code %d", ret);
-
-	tupdesc = SPI_tuptable->tupdesc;
-	if (tupdesc->natts != 1 ||
-		((tupdesc)->attrs[0])->atttypid != INT4OID)
-	{
-		elog(LOG, "table \"state\" is corrupted in database \"%s\","
-			 " please recreate diskquota extension",
-			 get_database_name(MyDatabaseId));
-		return false;
-	}
-
-	for (i = 0; i < SPI_processed; i++)
-	{
-		HeapTuple	tup = SPI_tuptable->vals[i];
-		Datum		dat;
-		int		state;
-		bool		isnull;
-
-		dat = SPI_getbinval(tup, tupdesc, 1, &isnull);
-		if (isnull)
-			continue;
-		state = DatumGetInt64(dat);
-
-		if (state == DISKQUOTA_READY_STATE)
-		{
-			return true;
-		}
-	}
-	ereport(LOG, (errmsg("Diskquota is not in ready state. "
-			"please run UDF init_table_size_table()")));
-	return false;
-}
-
-/*
  * Extract database list in GUC diskquota.monitored_database_list
  * Parameter is_refresh is used to indicate whether to refresh the
  * monitored database list when GUC monitored_database_list changed.
@@ -732,6 +668,7 @@ init_table_size_table(PG_FUNCTION_ARGS)
 			elog(ERROR, "cannot update state table: error code %d", ret);
 
 	SPI_finish();
+	PG_RETURN_VOID();
 }
 
 /*

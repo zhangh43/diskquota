@@ -289,6 +289,76 @@ init_disk_quota_model(void)
 }
 
 /*
+ * Load table size info from diskquota.table_size table.
+*/
+bool
+check_diskquota_state_is_ready(void)
+{
+	int			ret;
+	TupleDesc	tupdesc;
+	int			i;
+
+	RangeVar   *rv;
+	Relation	rel;
+
+	StartTransactionCommand();
+	SPI_connect();
+	PushActiveSnapshot(GetTransactionSnapshot());
+
+	/* check table diskquota.state exists*/
+	rv = makeRangeVar("diskquota", "state", -1);
+	rel = heap_openrv_extended(rv, AccessShareLock, true);
+	if (!rel)
+	{
+		/* configuration table is missing. */
+		elog(LOG, "table \"diskquota.state\" is missing in database \"%s\","
+			 " please recreate diskquota extension",
+			 get_database_name(MyDatabaseId));
+		return false;
+	}
+	heap_close(rel, NoLock);
+
+	/* check diskquota state from table diskquota.state */
+	ret = SPI_execute("select state from diskquota.state", true, 0);
+	if (ret != SPI_OK_SELECT)
+		elog(FATAL, "SPI_execute failed: error code %d", ret);
+
+	tupdesc = SPI_tuptable->tupdesc;
+	if (tupdesc->natts != 1 ||
+		((tupdesc)->attrs[0])->atttypid != INT4OID)
+	{
+		elog(LOG, "table \"state\" is corrupted in database \"%s\","
+			 " please recreate diskquota extension",
+			 get_database_name(MyDatabaseId));
+		return false;
+	}
+
+	for (i = 0; i < SPI_processed; i++)
+	{
+		HeapTuple	tup = SPI_tuptable->vals[i];
+		Datum		dat;
+		int		state;
+		bool		isnull;
+
+		dat = SPI_getbinval(tup, tupdesc, 1, &isnull);
+		if (isnull)
+			continue;
+		state = DatumGetInt64(dat);
+
+		if (state == DISKQUOTA_READY_STATE)
+		{
+			return true;
+		}
+	}
+	SPI_finish();
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+	ereport(LOG, (errmsg("Diskquota is not in ready state. "
+			"please run UDF init_table_size_table()")));
+	return false;
+}
+
+/*
  * diskquota worker will refresh disk quota model
  * periodically. It will reload quota setting and
  * recalculate the changed disk usage.
