@@ -290,6 +290,9 @@ init_disk_quota_model(void)
 											 HASH_ELEM | HASH_CONTEXT | HASH_FUNCTION);
 }
 
+/*
+ * Check whether the diskquota state is ready
+ */
 static bool
 do_check_diskquota_state_is_ready(void)
 {
@@ -351,7 +354,7 @@ do_check_diskquota_state_is_ready(void)
 }
 
 /*
- * Load table size info from diskquota.table_size table.
+ * Check whether the diskquota state is ready
 */
 bool
 check_diskquota_state_is_ready(void)

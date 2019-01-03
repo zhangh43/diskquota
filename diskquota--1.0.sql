@@ -12,7 +12,7 @@ create table diskquota.quota_config (targetOid oid, quotatype int, quotalimitMB 
 
 SELECT pg_catalog.pg_extension_config_dump('diskquota.quota_config', '');
 
-create table diskquota.table_size (tableOid oid, size int8, PRIMARY KEY(tableOid));
+create table diskquota.table_size (tableid oid, size int8, PRIMARY KEY(tableid));
 
 create table diskquota.state (state int, PRIMARY KEY(state));
 
