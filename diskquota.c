@@ -41,6 +41,7 @@ PG_MODULE_MAGIC;
 /* disk quota helper function */
 PG_FUNCTION_INFO_V1(set_schema_quota);
 PG_FUNCTION_INFO_V1(set_role_quota);
+PG_FUNCTION_INFO_V1(init_table_size_table);
 
 /* max number of monitored database with diskquota enabled */
 #define MAX_NUM_MONITORED_DB 10
@@ -79,6 +80,7 @@ static int64 get_size_in_mb(char *str);
 static void refresh_worker_list(void);
 static void set_quota_internal(Oid targetoid, int64 quota_limit_mb, QuotaType type);
 static int	start_worker(char *dbname);
+static bool check_diskquota_state_is_ready(void);
 
 /*
  * Entrypoint of diskquota module.
@@ -230,6 +232,26 @@ disk_quota_worker_main(Datum main_arg)
 	 * immediately
 	 */
 	init_disk_quota_model();
+	while (!got_sigterm)
+	{
+		int			rc;
+
+		/*
+		 *  Check whether the state is in ready mode.
+		 *  The state would be unknown, when you `create extension
+		 *  diskquota` at the first time.
+		 *  After running UDF init_table_size_table()
+		 *  The state will changed to be ready.
+		 */
+		if (check_diskquota_state_is_ready())
+		{
+			break;
+		}
+		rc = WaitLatch(&MyProc->procLatch,
+				WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
+				diskquota_naptime * 1000L);
+		ResetLatch(&MyProc->procLatch);
+	}
 	refresh_disk_quota_model(true);
 
 	/*
@@ -362,6 +384,69 @@ disk_quota_launcher_main(Datum main_arg)
 	}
 
 	proc_exit(1);
+}
+
+/*
+ * Load table size info from diskquota.table_size table.
+*/
+static bool
+check_diskquota_state_is_ready(void)
+{
+	int			ret;
+	TupleDesc	tupdesc;
+	int			i;
+
+	RangeVar   *rv;
+	Relation	rel;
+
+	/* check table diskquota.state exists*/
+	rv = makeRangeVar("diskquota", "state", -1);
+	rel = heap_openrv_extended(rv, AccessShareLock, true);
+	if (!rel)
+	{
+		/* configuration table is missing. */
+		elog(LOG, "table \"diskquota.state\" is missing in database \"%s\","
+			 " please recreate diskquota extension",
+			 get_database_name(MyDatabaseId));
+		return false;
+	}
+	heap_close(rel, NoLock);
+
+	/* check diskquota state from table diskquota.state */
+	ret = SPI_execute("select state from diskquota.state", true, 0);
+	if (ret != SPI_OK_SELECT)
+		elog(FATAL, "SPI_execute failed: error code %d", ret);
+
+	tupdesc = SPI_tuptable->tupdesc;
+	if (tupdesc->natts != 1 ||
+		((tupdesc)->attrs[0])->atttypid != INT4OID)
+	{
+		elog(LOG, "table \"state\" is corrupted in database \"%s\","
+			 " please recreate diskquota extension",
+			 get_database_name(MyDatabaseId));
+		return false;
+	}
+
+	for (i = 0; i < SPI_processed; i++)
+	{
+		HeapTuple	tup = SPI_tuptable->vals[i];
+		Datum		dat;
+		int		state;
+		bool		isnull;
+
+		dat = SPI_getbinval(tup, tupdesc, 1, &isnull);
+		if (isnull)
+			continue;
+		state = DatumGetInt64(dat);
+
+		if (state == DISKQUOTA_READY_STATE)
+		{
+			return true;
+		}
+	}
+	ereport(LOG, (errmsg("Diskquota is not in ready state. "
+			"please run UDF init_table_size_table()")));
+	return false;
 }
 
 /*
@@ -586,6 +671,65 @@ set_role_quota(PG_FUNCTION_ARGS)
 
 	set_quota_internal(roleoid, quota_limit_mb, ROLE_QUOTA);
 	PG_RETURN_VOID();
+}
+
+/*
+ * init table diskquota.table_size.
+ * calculate table size by UDF pg_total_relation_size
+ */
+Datum
+init_table_size_table(PG_FUNCTION_ARGS)
+{
+	int ret;
+	StringInfoData buf;
+
+	RangeVar   *rv;
+	Relation	rel;
+
+	/* ensure table diskquota.state exists*/
+	rv = makeRangeVar("diskquota", "state", -1);
+	rel = heap_openrv_extended(rv, AccessShareLock, true);
+	if (!rel)
+	{
+		/* configuration table is missing. */
+		elog(ERROR, "table \"diskquota.state\" is missing in database \"%s\","
+			 " please recreate diskquota extension",
+			 get_database_name(MyDatabaseId));
+	}
+	heap_close(rel, NoLock);
+
+	SPI_connect();
+
+	/* delete all the table size info in table_size if exist. */
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "delete from diskquota.table_size;");
+	ret = SPI_execute(buf.data, false, 0);
+	if (ret != SPI_OK_DELETE)
+		elog(ERROR, "cannot delete table_size table: error code %d", ret);
+
+	/* fill table_size table with table oid and size info. */
+	resetStringInfo(&buf);
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+					 "insert into diskquota.table_size "
+					 "select oid, pg_total_relation_size(oid) from pg_class "
+					 "where oid> %u and (relkind='r' or relkind='m');",
+					 FirstNormalObjectId);
+	ret = SPI_execute(buf.data, false, 0);
+	if (ret != SPI_OK_INSERT)
+		elog(ERROR, "cannot insert table_size table: error code %d", ret);
+
+	/* set diskquota state to ready. */
+	resetStringInfo(&buf);
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+					 "update diskquota.state set state = %u;",
+					 DISKQUOTA_READY_STATE);
+	ret = SPI_execute(buf.data, false, 0);
+		if (ret != SPI_OK_UPDATE)
+			elog(ERROR, "cannot update state table: error code %d", ret);
+
+	SPI_finish();
 }
 
 /*

@@ -73,11 +73,12 @@ static StringInfoData convert_map_to_string(HTAB *active_list);
 static HTAB *pull_active_list_from_seg(void);
 static void report_active_table_SmgrStat(SMgrRelation reln);
 static void report_active_table_AO(BufferedAppend * bufferedAppend);
+static bool load_table_size(void);
 
 void		init_active_table_hook(void);
 void		init_shm_worker_active_tables(void);
 void		init_lock_active_tables(void);
-HTAB	   *gp_fetch_active_tables(bool force);
+HTAB	   *gp_fetch_active_tables(bool is_init);
 
 /*
  * Register smgr hook to detect active table.
@@ -591,6 +592,78 @@ get_active_tables(void)
 	return local_active_table_stats_map;
 }
 
+/*
+ * Load table size info from diskquota.table_size table.
+*/
+static bool
+load_table_size(void)
+{
+	int			ret;
+	TupleDesc	tupdesc;
+	int			i;
+	bool		found;
+	DiskQuotaActiveTableEntry *quota_entry;
+
+	RangeVar   *rv;
+	Relation	rel;
+
+	rv = makeRangeVar("diskquota", "table_size", -1);
+	rel = heap_openrv_extended(rv, AccessShareLock, true);
+	if (!rel)
+	{
+		/* configuration table is missing. */
+		elog(LOG, "table \"table_size\" is missing in database \"%s\","
+			 " please recreate diskquota extension",
+			 get_database_name(MyDatabaseId));
+		return false;
+	}
+	heap_close(rel, NoLock);
+
+
+
+	ret = SPI_execute("select tableoid, size from diskquota.table_size", true, 0);
+	if (ret != SPI_OK_SELECT)
+		elog(FATAL, "SPI_execute failed: error code %d", ret);
+
+	tupdesc = SPI_tuptable->tupdesc;
+	if (tupdesc->natts != 2 ||
+		((tupdesc)->attrs[0])->atttypid != OIDOID ||
+		((tupdesc)->attrs[1])->atttypid != INT8OID)
+	{
+		elog(LOG, "table \"table_size\" is corrupted in database \"%s\","
+			 " please recreate diskquota extension",
+			 get_database_name(MyDatabaseId));
+		return false;
+	}
+
+	for (i = 0; i < SPI_processed; i++)
+	{
+		HeapTuple	tup = SPI_tuptable->vals[i];
+		Datum		dat;
+		Oid			tableOid;
+		int64		size;
+		bool		isnull;
+
+		dat = SPI_getbinval(tup, tupdesc, 1, &isnull);
+		if (isnull)
+			continue;
+		tableOid = DatumGetObjectId(dat);
+
+		dat = SPI_getbinval(tup, tupdesc, 2, &isnull);
+		if (isnull)
+			continue;
+		size = DatumGetInt64(dat);
+
+
+		quota_entry = (DiskQuotaActiveTableEntry *) hash_search(
+											local_table_stats_map,
+											&tableOid,
+											HASH_ENTER, &found);
+		quota_entry->tableoid = tableOid;
+		quota_entry->tablesize = size;
+	}
+	return true;
+}
 
 /*
  * Worker process at master need to collect
@@ -599,7 +672,7 @@ get_active_tables(void)
  * to obtainer the real table size at cluster level.
  */
 HTAB *
-gp_fetch_active_tables(bool force)
+gp_fetch_active_tables(bool is_init)
 {
 	CdbPgResults cdb_pgresults = {NULL, 0};
 	int			i,
@@ -624,9 +697,9 @@ gp_fetch_active_tables(bool force)
 										&ctl,
 										HASH_ELEM | HASH_CONTEXT | HASH_FUNCTION);
 
-	if (force)
+	if (is_init)
 	{
-		sql = "select * from diskquota.diskquota_fetch_table_stat(0, '{}'::oid[])";
+		load_table_size();
 	}
 	else
 	{
@@ -636,52 +709,47 @@ gp_fetch_active_tables(bool force)
 		appendStringInfo(&buffer, "select * from diskquota.diskquota_fetch_table_stat(2, '%s'::oid[])",
 						 map_string.data);
 		sql = buffer.data;
-	}
 
-	elog(DEBUG1, "CHECK SPI QUERY is %s", sql);
+		elog(DEBUG1, "CHECK SPI QUERY is %s", sql);
 
-	CdbDispatchCommand(sql, DF_NONE, &cdb_pgresults);
+		CdbDispatchCommand(sql, DF_NONE, &cdb_pgresults);
 
-	/* collect data from each segment */
-	for (i = 0; i < cdb_pgresults.numResults; i++)
-	{
+		/* collect data from each segment */
+		for (i = 0; i < cdb_pgresults.numResults; i++) {
 
-		Size		tableSize;
-		bool		found;
-		Oid			tableOid;
-		DiskQuotaActiveTableEntry *entry;
+			Size tableSize;
+			bool found;
+			Oid tableOid;
+			DiskQuotaActiveTableEntry *entry;
 
-		struct pg_result *pgresult = cdb_pgresults.pg_results[i];
+			struct pg_result *pgresult = cdb_pgresults.pg_results[i];
 
-		if (PQresultStatus(pgresult) != PGRES_TUPLES_OK)
-		{
-			cdbdisp_clearCdbPgResults(&cdb_pgresults);
-			ereport(ERROR,
-					(errmsg("unexpected result from segment: %d",
-							PQresultStatus(pgresult))));
-		}
-
-		for (j = 0; j < PQntuples(pgresult); j++)
-		{
-			tableOid = atooid(PQgetvalue(pgresult, j, 0));
-			tableSize = (Size) atoll(PQgetvalue(pgresult, j, 1));
-
-			entry = (DiskQuotaActiveTableEntry *) hash_search(local_table_stats_map, &tableOid, HASH_ENTER, &found);
-
-			if (!found)
-			{
-				entry->tableoid = tableOid;
-				entry->tablesize = tableSize;
+			if (PQresultStatus(pgresult) != PGRES_TUPLES_OK) {
+				cdbdisp_clearCdbPgResults(&cdb_pgresults);
+				ereport(ERROR,
+						(errmsg("unexpected result from segment: %d",
+								PQresultStatus(pgresult))));
 			}
-			else
-			{
-				entry->tablesize = entry->tablesize + tableSize;
+
+			for (j = 0; j < PQntuples(pgresult); j++) {
+				tableOid = atooid(PQgetvalue(pgresult, j, 0));
+				tableSize = (Size) atoll(PQgetvalue(pgresult, j, 1));
+
+				entry = (DiskQuotaActiveTableEntry *) hash_search(
+						local_table_stats_map, &tableOid, HASH_ENTER, &found);
+
+				if (!found) {
+					entry->tableoid = tableOid;
+					entry->tablesize = tableSize;
+				} else {
+					entry->tablesize = entry->tablesize + tableSize;
+				}
+
 			}
 
 		}
-
+		cdbdisp_clearCdbPgResults(&cdb_pgresults);
 	}
-	cdbdisp_clearCdbPgResults(&cdb_pgresults);
 	return local_table_stats_map;
 }
 

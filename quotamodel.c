@@ -125,8 +125,8 @@ disk_quota_shared_state *active_table_shm_lock = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 
 /* functions to refresh disk quota model*/
-static void refresh_disk_quota_usage(bool force);
-static void calculate_table_disk_usage(bool force);
+static void refresh_disk_quota_usage(bool is_init);
+static void calculate_table_disk_usage(bool is_init);
 static void calculate_schema_disk_usage(void);
 static void calculate_role_disk_usage(void);
 static void flush_local_black_map(void);
@@ -294,7 +294,7 @@ init_disk_quota_model(void)
  * recalculate the changed disk usage.
  */
 void
-refresh_disk_quota_model(bool force)
+refresh_disk_quota_model(bool is_init)
 {
 	elog(DEBUG1, "check disk quota begin");
 	StartTransactionCommand();
@@ -303,7 +303,7 @@ refresh_disk_quota_model(bool force)
 	/* skip refresh model when load_quotas failed */
 	if (load_quotas())
 	{
-		refresh_disk_quota_usage(force);
+		refresh_disk_quota_usage(is_init);
 	}
 	SPI_finish();
 	PopActiveSnapshot();
@@ -518,7 +518,7 @@ update_role_map(Oid owneroid, int64 updatesize)
  *
  */
 static void
-calculate_table_disk_usage(bool force)
+calculate_table_disk_usage(bool is_init)
 {
 	bool		found;
 	bool		active_tbl_found = false;
@@ -534,7 +534,7 @@ calculate_table_disk_usage(bool force)
 	classRel = heap_open(RelationRelationId, AccessShareLock);
 	relScan = heap_beginscan_catalog(classRel, 0, NULL);
 
-	local_active_table_stat_map = gp_fetch_active_tables(force);
+	local_active_table_stat_map = gp_fetch_active_tables(is_init);
 
 	/* unset is_exist flag for tsentry in table_size_map */
 	hash_seq_init(&iter, table_size_map);

@@ -16,6 +16,11 @@ typedef enum
 	FETCH_ACTIVE_SIZE			/* fetch size for active tables */
 }			FetchTableStatType;
 
+typedef enum
+{
+	DISKQUOTA_UNKNOWN_STATE,
+	DISKQUOTA_READY_STATE
+};			DiskQuotaState;
 typedef struct
 {
 	LWLock	   *lock;			/* protects shared memory of blackMap */

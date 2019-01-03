@@ -12,12 +12,23 @@ create table diskquota.quota_config (targetOid oid, quotatype int, quotalimitMB 
 
 SELECT pg_catalog.pg_extension_config_dump('diskquota.quota_config', '');
 
+create table diskquota.table_size (tableOid oid, size int8, PRIMARY KEY(tableOid));
+
+create table diskquota.state (state int, PRIMARY KEY(state));
+
+insert into diskquota.state values(0);
+
 CREATE FUNCTION set_schema_quota(text, text)
 RETURNS void STRICT
 AS 'MODULE_PATHNAME'
 LANGUAGE C;
 
 CREATE FUNCTION set_role_quota(text, text)
+RETURNS void STRICT
+AS 'MODULE_PATHNAME'
+LANGUAGE C;
+
+CREATE FUNCTION init_table_size_table()
 RETURNS void STRICT
 AS 'MODULE_PATHNAME'
 LANGUAGE C;
