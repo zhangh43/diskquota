@@ -70,6 +70,7 @@ struct TableSizeEntry
 	int64		totalsize;
 	bool		is_exist;		/* flag used to check whether table is already
 								 * dropped */
+	bool		need_flush; /* whether need to flush to table table_size*/
 };
 
 /* local cache of namespace disk size */
@@ -129,6 +130,7 @@ static void refresh_disk_quota_usage(bool is_init);
 static void calculate_table_disk_usage(bool is_init);
 static void calculate_schema_disk_usage(void);
 static void calculate_role_disk_usage(void);
+static void flush_to_table_size(void);
 static void flush_local_black_map(void);
 static void check_disk_quota_by_oid(Oid targetOid, int64 current_usage, QuotaType type);
 static void update_namespace_map(Oid namespaceoid, int64 updatesize);
@@ -408,6 +410,8 @@ refresh_disk_quota_usage(bool force)
 	calculate_table_disk_usage(force);
 	calculate_schema_disk_usage();
 	calculate_role_disk_usage();
+	/* flush local table_size_map to user table table_size */
+	flush_to_table_size();
 	/* copy local black map back to shared black map */
 	flush_local_black_map();
 }
@@ -658,6 +662,7 @@ calculate_table_disk_usage(bool is_init)
 			tsentry->owneroid = 0;
 			tsentry->namespaceoid = 0;
 			tsentry->reloid = 0;
+			tsentry->need_flush = true;
 		}
 
 		/* mark tsentry is_exist */
@@ -681,6 +686,7 @@ calculate_table_disk_usage(bool is_init)
 				tsentry->namespaceoid = classForm->relnamespace;
 				tsentry->owneroid = classForm->relowner;
 				tsentry->totalsize = (int64) active_table_entry->tablesize;
+				tsentry->need_flush = true;
 				update_namespace_map(tsentry->namespaceoid, tsentry->totalsize);
 				update_role_map(tsentry->owneroid, tsentry->totalsize);
 			}
@@ -693,9 +699,16 @@ calculate_table_disk_usage(bool is_init)
 				int64		oldtotalsize = tsentry->totalsize;
 
 				tsentry->totalsize = (int64) active_table_entry->tablesize;
+				tsentry->need_flush = true;
 				update_namespace_map(tsentry->namespaceoid, tsentry->totalsize - oldtotalsize);
 				update_role_map(tsentry->owneroid, tsentry->totalsize - oldtotalsize);
 			}
+		}
+
+		/* table size info doesn't need to flush at init quota model stage*/
+		if (is_init)
+		{
+			tsentry->need_flush = false;
 		}
 
 		/* if schema change, transfer the file size */
@@ -787,6 +800,60 @@ calculate_role_disk_usage(void)
 		ReleaseSysCache(tuple);
 		check_disk_quota_by_oid(rolentry->owneroid, rolentry->totalsize, ROLE_QUOTA);
 	}
+}
+
+/*
+ * Flush the table_size_map to user table diskquota.table_size
+ * To improve update performance, we first delete all the need_to_flush
+ * entries in table table_size. And then insert new table size entries into
+ * table table_size.
+ */
+static
+void flush_to_table_size(void)
+{
+	HASH_SEQ_STATUS iter;
+	TableSizeEntry *tsentry = NULL;
+	StringInfoData delete_statement;
+	StringInfoData insert_statement;
+	bool is_first = true;
+	int ret;
+
+	/* return immediately if flush interval is not reached */
+
+	/* concatenate all the need_to_flush table to SQL string */
+	initStringInfo(&delete_statement);
+	appendStringInfo(&delete_statement, "delete from diskquota.table_size where tableid in (");
+	initStringInfo(&insert_statement);
+	appendStringInfo(&insert_statement, "insert into diskquota.table_size values ");
+	hash_seq_init(&iter, table_size_map);
+	while ((tsentry = hash_seq_search(&iter)) != NULL)
+	{
+		if (tsentry->need_flush == true)
+		{
+			tsentry->need_flush = false;
+			if (!is_first)
+			{
+				appendStringInfo(&delete_statement,",");
+				appendStringInfo(&delete_statement,",");
+			}
+			appendStringInfo(&delete_statement,"%u",tsentry->reloid);
+			appendStringInfo(&delete_statement,"(%u,%ld)",tsentry->reloid, tsentry->totalsize);
+		}
+	}
+	appendStringInfo(&delete_statement, ");");
+	appendStringInfo(&insert_statement, ";");
+	elog(LOG,"diskquota delete_statement: %s", delete_statement.data);
+	elog(LOG,"diskquota insert_statement: %s", insert_statement.data);
+
+
+	ret = SPI_execute(delete_statement.data, false, 0);
+	if (ret != SPI_OK_DELETE)
+		elog(ERROR, "SPI_execute failed: error code %d", ret);
+
+	ret = SPI_execute(insert_statement.data, false, 0);
+	if (ret != SPI_OK_INSERT)
+		elog(ERROR, "SPI_execute failed: error code %d", ret);
+
 }
 
 /*

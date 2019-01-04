@@ -625,7 +625,7 @@ load_table_size(HTAB	 *local_table_stats_map)
 
 	ret = SPI_execute("select tableid, size from diskquota.table_size", true, 0);
 	if (ret != SPI_OK_SELECT)
-		elog(FATAL, "SPI_execute failed: error code %d", ret);
+		elog(ERROR, "SPI_execute failed: error code %d", ret);
 
 	tupdesc = SPI_tuptable->tupdesc;
 	if (tupdesc->natts != 2 ||
