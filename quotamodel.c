@@ -661,7 +661,6 @@ calculate_table_disk_usage(bool is_init)
 			tsentry->totalsize = 0;
 			tsentry->owneroid = 0;
 			tsentry->namespaceoid = 0;
-			tsentry->reloid = 0;
 			tsentry->need_flush = true;
 		}
 
@@ -731,7 +730,10 @@ calculate_table_disk_usage(bool is_init)
 	heap_close(classRel, AccessShareLock);
 	hash_destroy(local_active_table_stat_map);
 
-	/* process removed tables */
+	/*
+	 * Process removed tables. Reduce schema and role size firstly.
+	 * Remove table from table_size_map in flush_to_table_size() function later.
+	 */
 	hash_seq_init(&iter, table_size_map);
 	while ((tsentry = hash_seq_search(&iter)) != NULL)
 	{
@@ -739,11 +741,6 @@ calculate_table_disk_usage(bool is_init)
 		{
 			update_role_map(tsentry->owneroid, -1 * tsentry->totalsize);
 			update_namespace_map(tsentry->namespaceoid, -1 * tsentry->totalsize);
-
-			hash_search(table_size_map,
-						&tsentry->reloid,
-						HASH_REMOVE, NULL);
-			continue;
 		}
 	}
 }
@@ -815,7 +812,9 @@ void flush_to_table_size(void)
 	TableSizeEntry *tsentry = NULL;
 	StringInfoData delete_statement;
 	StringInfoData insert_statement;
-	bool has_need_flush_table = false;
+	bool delete_statement_flag = false;
+	bool insert_statement_flag = false;
+	bool is_first_record = true;
 	int ret;
 
 	/* return immediately if flush interval is not reached */
@@ -828,30 +827,56 @@ void flush_to_table_size(void)
 	hash_seq_init(&iter, table_size_map);
 	while ((tsentry = hash_seq_search(&iter)) != NULL)
 	{
-		if (tsentry->need_flush == true)
+		/* delete dropped table from both table_size_map and table table_size */
+		if (tsentry->is_exist == false)
 		{
-			tsentry->need_flush = false;
-			if (has_need_flush_table)
+			if (is_first_record)
 			{
-				appendStringInfo(&delete_statement,",");
-				appendStringInfo(&delete_statement,",");
+				is_first_record = false;
+			}
+			else
+			{
+				appendStringInfo(&delete_statement, ",");
 			}
 			appendStringInfo(&delete_statement,"%u",tsentry->reloid);
-			appendStringInfo(&delete_statement,"(%u,%ld)",tsentry->reloid, tsentry->totalsize);
+			delete_statement_flag = true;
+
+			hash_search(table_size_map,
+						&tsentry->reloid,
+						HASH_REMOVE, NULL);
 		}
-		has_need_flush_table = true;
+		else if (tsentry->need_flush == true)
+		{
+			tsentry->need_flush = false;
+			if (is_first_record)
+			{
+				is_first_record = false;
+			}
+			else
+			{
+				appendStringInfo(&delete_statement, ",");
+				appendStringInfo(&insert_statement, ",");
+			}
+			appendStringInfo(&delete_statement,"%u",tsentry->reloid);
+			appendStringInfo(&insert_statement,"(%u,%ld)",tsentry->reloid, tsentry->totalsize);
+			delete_statement_flag = true;
+			insert_statement_flag = true;
+		}
 	}
 	appendStringInfo(&delete_statement, ");");
 	appendStringInfo(&insert_statement, ";");
-	elog(LOG,"diskquota delete_statement: %s", delete_statement.data);
-	elog(LOG,"diskquota insert_statement: %s", insert_statement.data);
 
-	if (has_need_flush_table)
+
+	if (delete_statement_flag)
 	{
+		elog(DEBUG1,"[diskquota] table_size delete_statement: %s", delete_statement.data);
 		ret = SPI_execute(delete_statement.data, false, 0);
 		if (ret != SPI_OK_DELETE)
 			elog(ERROR, "SPI_execute failed: error code %d", ret);
-
+	}
+	if (insert_statement_flag)
+	{
+		elog(DEBUG1,"[diskquota] table_size insert_statement: %s", insert_statement.data);
 		ret = SPI_execute(insert_statement.data, false, 0);
 		if (ret != SPI_OK_INSERT)
 			elog(ERROR, "SPI_execute failed: error code %d", ret);
