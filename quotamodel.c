@@ -815,7 +815,7 @@ void flush_to_table_size(void)
 	TableSizeEntry *tsentry = NULL;
 	StringInfoData delete_statement;
 	StringInfoData insert_statement;
-	bool is_first = true;
+	bool has_need_flush_table = false;
 	int ret;
 
 	/* return immediately if flush interval is not reached */
@@ -831,7 +831,7 @@ void flush_to_table_size(void)
 		if (tsentry->need_flush == true)
 		{
 			tsentry->need_flush = false;
-			if (!is_first)
+			if (has_need_flush_table)
 			{
 				appendStringInfo(&delete_statement,",");
 				appendStringInfo(&delete_statement,",");
@@ -839,20 +839,23 @@ void flush_to_table_size(void)
 			appendStringInfo(&delete_statement,"%u",tsentry->reloid);
 			appendStringInfo(&delete_statement,"(%u,%ld)",tsentry->reloid, tsentry->totalsize);
 		}
+		has_need_flush_table = true;
 	}
 	appendStringInfo(&delete_statement, ");");
 	appendStringInfo(&insert_statement, ";");
 	elog(LOG,"diskquota delete_statement: %s", delete_statement.data);
 	elog(LOG,"diskquota insert_statement: %s", insert_statement.data);
 
+	if (has_need_flush_table)
+	{
+		ret = SPI_execute(delete_statement.data, false, 0);
+		if (ret != SPI_OK_DELETE)
+			elog(ERROR, "SPI_execute failed: error code %d", ret);
 
-	ret = SPI_execute(delete_statement.data, false, 0);
-	if (ret != SPI_OK_DELETE)
-		elog(ERROR, "SPI_execute failed: error code %d", ret);
-
-	ret = SPI_execute(insert_statement.data, false, 0);
-	if (ret != SPI_OK_INSERT)
-		elog(ERROR, "SPI_execute failed: error code %d", ret);
+		ret = SPI_execute(insert_statement.data, false, 0);
+		if (ret != SPI_OK_INSERT)
+			elog(ERROR, "SPI_execute failed: error code %d", ret);
+	}
 
 }
 
