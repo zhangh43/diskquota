@@ -830,15 +830,7 @@ void flush_to_table_size(void)
 		/* delete dropped table from both table_size_map and table table_size */
 		if (tsentry->is_exist == false)
 		{
-			if (is_first_record)
-			{
-				is_first_record = false;
-			}
-			else
-			{
-				appendStringInfo(&delete_statement, ",");
-			}
-			appendStringInfo(&delete_statement,"%u",tsentry->reloid);
+			appendStringInfo(&delete_statement,"%u, ",tsentry->reloid);
 			delete_statement_flag = true;
 
 			hash_search(table_size_map,
@@ -848,21 +840,14 @@ void flush_to_table_size(void)
 		else if (tsentry->need_flush == true)
 		{
 			tsentry->need_flush = false;
-			if (is_first_record)
-			{
-				is_first_record = false;
-			}
-			else
-			{
-				appendStringInfo(&delete_statement, ",");
-				appendStringInfo(&insert_statement, ",");
-			}
-			appendStringInfo(&delete_statement,"%u",tsentry->reloid);
-			appendStringInfo(&insert_statement,"(%u,%ld)",tsentry->reloid, tsentry->totalsize);
+			appendStringInfo(&delete_statement,"%u, ",tsentry->reloid);
+			appendStringInfo(&insert_statement,"(%u,%ld), ",tsentry->reloid, tsentry->totalsize);
 			delete_statement_flag = true;
 			insert_statement_flag = true;
 		}
 	}
+	truncateStringInfo(&delete_statement, delete_statement.len - strlen(", "));
+	truncateStringInfo(&insert_statement, insert_statement.len - strlen(", "));
 	appendStringInfo(&delete_statement, ");");
 	appendStringInfo(&insert_statement, ";");
 
