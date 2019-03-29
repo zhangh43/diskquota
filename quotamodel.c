@@ -135,7 +135,7 @@ static void update_role_map(Oid owneroid, int64 updatesize);
 static void remove_namespace_map(Oid namespaceoid);
 static void remove_role_map(Oid owneroid);
 static bool load_quotas(void);
-static bool do_load_quotas(void);
+static void do_load_quotas(void);
 static bool do_check_diskquota_state_is_ready(void);
 
 static Size DiskQuotaShmemSize(void);
@@ -398,18 +398,46 @@ refresh_disk_quota_model(bool is_init)
 static void
 refresh_disk_quota_usage(bool force)
 {
+	bool ret = true;
+	volatile bool connected = false;
+
 	StartTransactionCommand();
-	SPI_connect();
 	PushActiveSnapshot(GetTransactionSnapshot());
 
-	/* recalculate the disk usage of table, schema and role */
-	calculate_table_disk_usage(force);
-	calculate_schema_disk_usage();
-	calculate_role_disk_usage();
-	/* flush local table_size_map to user table table_size */
-	flush_to_table_size();
-	/* copy local black map back to shared black map */
-	flush_local_black_map();
+	PG_TRY();
+	{
+		if (SPI_OK_CONNECT != SPI_connect())
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("unable to connect to execute internal query")));
+		}
+		connected = true;
+		/* recalculate the disk usage of table, schema and role */
+		calculate_table_disk_usage(force);
+		calculate_schema_disk_usage();
+		calculate_role_disk_usage();
+		/* flush local table_size_map to user table table_size */
+		flush_to_table_size();
+		/* copy local black map back to shared black map */
+		flush_local_black_map();
+	}
+	PG_CATCH();
+	{
+		EmitErrorReport();
+		FlushErrorState();
+		ret = false;
+	}
+	PG_END_TRY();
+	if (connected)
+		SPI_finish();
+	PopActiveSnapshot();
+	if(ret)
+		CommitTransactionCommand();
+	else
+		AbortCurrentTransaction();
+
+
 
 	SPI_finish();
 	PopActiveSnapshot();
@@ -891,23 +919,44 @@ flush_to_table_size(void)
 static bool
 load_quotas(void)
 {
-	bool ret;
+	bool ret = true;
+	volatile bool connected = false;
+
 	StartTransactionCommand();
-	SPI_connect();
 	PushActiveSnapshot(GetTransactionSnapshot());
 
-	ret = do_load_quotas();
-
-	SPI_finish();
+	PG_TRY();
+	{
+		if (SPI_OK_CONNECT != SPI_connect())
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("unable to connect to execute internal query")));
+		}
+		connected = true;
+		do_load_quotas();
+	}
+	PG_CATCH();
+	{
+		EmitErrorReport();
+		FlushErrorState();
+		ret = false;
+	}
+	PG_END_TRY();
+	if (connected)
+		SPI_finish();
 	PopActiveSnapshot();
-	CommitTransactionCommand();
+	if(ret)
+		CommitTransactionCommand();
+	else
+		AbortCurrentTransaction();
 	return ret;
 }
 
 /*
  * Load quotas from diskquota configuration table(quota_config).
 */
-static bool
+static void
 do_load_quotas(void)
 {
 	int			ret;
@@ -925,10 +974,9 @@ do_load_quotas(void)
 	if (!rel)
 	{
 		/* configuration table is missing. */
-		elog(LOG, "[diskquota] configuration table \"quota_config\" is missing in database \"%s\","
+		elog(ERROR, "[diskquota] configuration table \"quota_config\" is missing in database \"%s\","
 			 " please recreate diskquota extension",
 			 get_database_name(MyDatabaseId));
-		return false;
 	}
 	heap_close(rel, AccessShareLock);
 	/*
@@ -963,10 +1011,9 @@ do_load_quotas(void)
 		((tupdesc)->attrs[1])->atttypid != INT4OID ||
 		((tupdesc)->attrs[2])->atttypid != INT8OID)
 	{
-		elog(LOG, "[diskquota] configuration table \"quota_config\" is corrupted in database \"%s\","
+		elog(ERROR, "[diskquota] configuration table \"quota_config\" is corrupted in database \"%s\","
 			 " please recreate diskquota extension",
 			 get_database_name(MyDatabaseId));
-		return false;
 	}
 
 	for (i = 0; i < SPI_processed; i++)
@@ -1008,7 +1055,7 @@ do_load_quotas(void)
 			quota_entry->limitsize = quota_limit_mb;
 		}
 	}
-	return true;
+	return ;
 }
 
 /*
