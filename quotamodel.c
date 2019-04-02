@@ -163,7 +163,7 @@ init_lwlocks(void)
 {
 	diskquota_locks.active_table_lock = LWLockAssign();
 	diskquota_locks.black_map_lock = LWLockAssign();
-	diskquota_locks.message_box_lock = LWLockAssign();
+	diskquota_locks.extension_ddl_message_lock = LWLockAssign();
 	diskquota_locks.extension_lock = LWLockAssign();
 }
 

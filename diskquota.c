@@ -65,6 +65,8 @@ PG_FUNCTION_INFO_V1(init_table_size_table);
 /* max number of monitored database with diskquota enabled */
 #define MAX_NUM_MONITORED_DB 10
 
+#define DISKQUOTA_DB	"diskquota"
+
 /* flags set by signal handlers */
 static volatile sig_atomic_t got_sighup = false;
 static volatile sig_atomic_t got_sigterm = false;
@@ -86,7 +88,7 @@ struct DiskQuotaWorkerEntry
 };
 
 DiskQuotaLocks diskquota_locks;
-MessageBox *message_box = NULL;
+ExtensionDDLMessage *extension_ddl_message = NULL;
 
 /* using hash table to support incremental update the table size entry.*/
 static HTAB *disk_quota_worker_map = NULL;
@@ -109,8 +111,8 @@ static inline void exec_simple_utility(const char *sql);
 static void exec_simple_spi(const char *sql, int expected_code);
 static bool add_db_to_config(Oid dbid);
 static void del_db_from_config(Oid dbid);
-static void process_message_box(void);
-static void process_message_box_internal(MessageResult * code, MessageBox local_message_box);
+static void process_extension_ddl_message(void);
+static void do_process_extension_ddl_message(MessageResult * code, ExtensionDDLMessage local_extension_ddl_message);
 static void dq_object_access_hook(ObjectAccessType access, Oid classId,
 					  Oid objectId, int subId, void *arg);
 static const char *err_code_to_err_message(MessageResult code);
@@ -606,9 +608,59 @@ disk_quota_launcher_main(Datum main_arg)
 	/* We're now ready to receive signals */
 	BackgroundWorkerUnblockSignals();
 
-	LWLockAcquire(diskquota_locks.message_box_lock, LW_EXCLUSIVE);
-	message_box->launcher_pid = MyProcPid;
-	LWLockRelease(diskquota_locks.message_box_lock);
+	/*
+	 * diskquota launcher need to access database "diskquota"
+	 * to maintain the databases which enable diskquota
+	 * extension. If database "diskquota" is not created,
+	 * report a warning in log.
+	 */
+	while (!got_sigterm)
+	{
+		int			rc;
+
+		CHECK_FOR_INTERRUPTS();
+
+		/*
+		 * Check whether the state is in ready mode. The state would be
+		 * unknown, when you `create extension diskquota` at the first time.
+		 * After running UDF init_table_size_table() The state will changed to
+		 * be ready.
+		 */
+		if (FindMyDatabase(DISKQUOTA_DB, &MyDatabaseId, &MyDatabaseTableSpace))
+			break;
+		else
+			elog(WARNING,"[diskquota launcher] database diskquota need to be "
+					"created before using diskquota extension.");
+
+		rc = WaitLatch(&MyProc->procLatch,
+					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
+					   diskquota_naptime * 1000L);
+		ResetLatch(&MyProc->procLatch);
+
+		/* emergency bailout if postmaster has died */
+		if (rc & WL_POSTMASTER_DEATH)
+			proc_exit(1);
+
+		/* process extension ddl, now someone is holding message_box_lock */
+		if (got_sigusr1)
+		{
+			got_sigusr1 = false;
+			process_extension_ddl_message();
+		}
+
+		/*
+		 * In case of a SIGHUP, just reload the configuration.
+		 */
+		if (got_sighup)
+		{
+			got_sighup = false;
+			ProcessConfigFile(PGC_SIGHUP);
+		}
+	}
+
+	LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_EXCLUSIVE);
+	extension_ddl_message->launcher_pid = MyProcPid;
+	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
 	/* Connect to our database */
 	BackgroundWorkerInitializeConnection("diskquota", NULL);
 
@@ -649,11 +701,12 @@ disk_quota_launcher_main(Datum main_arg)
 		/* emergency bailout if postmaster has died */
 		if (rc & WL_POSTMASTER_DEATH)
 			proc_exit(1);
+
 		/* process message box, now someone is holding message_box_lock */
 		if (got_sigusr1)
 		{
 			got_sigusr1 = false;
-			process_message_box();
+			process_extension_ddl_message();
 		}
 
 		/*
@@ -1079,14 +1132,14 @@ diskquota_start_worker(PG_FUNCTION_ARGS)
 	 * extension at the same time.
 	 */
 	LWLockAcquire(diskquota_locks.extension_lock, LW_EXCLUSIVE);
-	LWLockAcquire(diskquota_locks.message_box_lock, LW_EXCLUSIVE);
-	message_box->req_pid = MyProcPid;
-	message_box->cmd = CMD_CREATE_EXTENSION;
-	message_box->result = ERR_PENDING;
-	message_box->dbid = MyDatabaseId;
+	LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_EXCLUSIVE);
+	extension_ddl_message->req_pid = MyProcPid;
+	extension_ddl_message->cmd = CMD_CREATE_EXTENSION;
+	extension_ddl_message->result = ERR_PENDING;
+	extension_ddl_message->dbid = MyDatabaseId;
 	/* setup sig handler to diskquota launcher process */
 	rc = kill(message_box->launcher_pid, SIGUSR1);
-	LWLockRelease(diskquota_locks.message_box_lock);
+	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
 	if (rc == 0)
 	{
 		int			count = WAIT_TIME_COUNT;
@@ -1100,48 +1153,48 @@ diskquota_start_worker(PG_FUNCTION_ARGS)
 			if (rc & WL_POSTMASTER_DEATH)
 				break;
 			ResetLatch(&MyProc->procLatch);
-			LWLockAcquire(diskquota_locks.message_box_lock, LW_SHARED);
-			if (message_box->result != ERR_PENDING)
+			LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_SHARED);
+			if (extension_ddl_message->result != ERR_PENDING)
 			{
-				LWLockRelease(diskquota_locks.message_box_lock);
+				LWLockRelease(diskquota_locks.extension_ddl_message_lock);
 				break;
 			}
-			LWLockRelease(diskquota_locks.message_box_lock);
+			LWLockRelease(diskquota_locks.extension_ddl_message_lock);
 		}
 	}
-	LWLockAcquire(diskquota_locks.message_box_lock, LW_SHARED);
-	if (message_box->result != ERR_OK)
+	LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_SHARED);
+	if (extension_ddl_message->result != ERR_OK)
 	{
-		LWLockRelease(diskquota_locks.message_box_lock);
+		LWLockRelease(diskquota_locks.extension_ddl_message_lock);
 		LWLockRelease(diskquota_locks.extension_lock);
-		elog(ERROR, "[diskquota] failed to create diskquota extension: %s", err_code_to_err_message((MessageResult) message_box->result));
+		elog(ERROR, "[diskquota] failed to create diskquota extension: %s", err_code_to_err_message((MessageResult) extension_ddl_message->result));
 	}
-	LWLockRelease(diskquota_locks.message_box_lock);
+	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
 	LWLockRelease(diskquota_locks.extension_lock);
 	PG_RETURN_VOID();
 }
 
 static void
-process_message_box_internal(MessageResult * code, MessageBox local_message_box)
+do_process_extension_ddl_message(MessageResult * code, ExtensionDDLMessage local_extension_ddl_message)
 {
 	int			old_num_db = num_db;
 
 	PG_TRY();
 	{
-		switch (local_message_box.cmd)
+		switch (local_extension_ddl_message.cmd)
 		{
 			case CMD_CREATE_EXTENSION:
-				on_add_db(local_message_box.dbid, code);
+				on_add_db(local_extension_ddl_message.dbid, code);
 				num_db++;
 				*code = ERR_OK;
 				break;
 			case CMD_DROP_EXTENSION:
-				on_del_db(local_message_box.dbid);
+				on_del_db(local_extension_ddl_message.dbid);
 				num_db--;
 				*code = ERR_OK;
 				break;
 			default:
-				elog(LOG, "[diskquota]:received unsupported message cmd=%d", local_message_box.cmd);
+				elog(LOG, "[diskquota]:received unsupported message cmd=%d", local_extension_ddl_message.cmd);
 				*code = ERR_UNKNOWN;
 				break;
 		}
@@ -1164,35 +1217,35 @@ process_message_box_internal(MessageResult * code, MessageBox local_message_box)
  * and return an error code back to the backend process.
  */
 static void
-process_message_box()
+process_extension_ddl_message()
 {
 	MessageResult code = ERR_UNKNOWN;
-	MessageBox	local_message_box;
+	ExtensionDDLMessage	local_extension_ddl_message;
 
-	LWLockAcquire(diskquota_locks.message_box_lock, LW_SHARED);
-	memcpy(&local_message_box, message_box, sizeof(MessageBox));
-	LWLockRelease(diskquota_locks.message_box_lock);
+	LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_SHARED);
+	memcpy(&local_extension_ddl_message, extension_ddl_message, sizeof(ExtensionDDLMessage));
+	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
 
 	/* create/drop extension message must be valid */
-	if (local_message_box.req_pid == 0 || local_message_box.launcher_pid != MyProcPid)
+	if (local_extension_ddl_message.req_pid == 0 || local_extension_ddl_message.launcher_pid != MyProcPid)
 	{
 		return;
 	}
 
 	elog(LOG, "[diskquota]: received create/drop extension diskquota message");
 	StartTransactionCommand();
-	process_message_box_internal(&code, local_message_box);
+	do_process_extension_ddl_message(&code, local_extension_ddl_message);
 	if (code == ERR_OK)
 		CommitTransactionCommand();
 	else
 		AbortCurrentTransaction();
 
 	/* Send createdrop extension diskquota result back to QD */
-	LWLockAcquire(diskquota_locks.message_box_lock, LW_EXCLUSIVE);
-	memset(message_box, 0, sizeof(MessageBox));
-	message_box->launcher_pid = MyProcPid;
-	message_box->result = (int) code;
-	LWLockRelease(diskquota_locks.message_box_lock);
+	LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_EXCLUSIVE);
+	memset(extension_ddl_message, 0, sizeof(ExtensionDDLMessage));
+	extension_ddl_message->launcher_pid = MyProcPid;
+	extension_ddl_message->result = (int) code;
+	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
 }
 
 /*
@@ -1219,13 +1272,13 @@ dq_object_access_hook(ObjectAccessType access, Oid classId,
 	 * extension at the same time.
 	 */
 	LWLockAcquire(diskquota_locks.extension_lock, LW_EXCLUSIVE);
-	LWLockAcquire(diskquota_locks.message_box_lock, LW_EXCLUSIVE);
-	message_box->req_pid = MyProcPid;
-	message_box->cmd = CMD_DROP_EXTENSION;
-	message_box->result = ERR_PENDING;
-	message_box->dbid = MyDatabaseId;
+	LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_EXCLUSIVE);
+	extension_ddl_message->req_pid = MyProcPid;
+	extension_ddl_message->cmd = CMD_DROP_EXTENSION;
+	extension_ddl_message->result = ERR_PENDING;
+	extension_ddl_message->dbid = MyDatabaseId;
 	rc = kill(message_box->launcher_pid, SIGUSR1);
-	LWLockRelease(diskquota_locks.message_box_lock);
+	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
 	if (rc == 0)
 	{
 		int			count = WAIT_TIME_COUNT;
@@ -1239,23 +1292,23 @@ dq_object_access_hook(ObjectAccessType access, Oid classId,
 			if (rc & WL_POSTMASTER_DEATH)
 				break;
 			ResetLatch(&MyProc->procLatch);
-			LWLockAcquire(diskquota_locks.message_box_lock, LW_SHARED);
-			if (message_box->result != ERR_PENDING)
+			LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_SHARED);
+			if (extension_ddl_message->result != ERR_PENDING)
 			{
-				LWLockRelease(diskquota_locks.message_box_lock);
+				LWLockRelease(diskquota_locks.extension_ddl_message_lock);
 				break;
 			}
-			LWLockRelease(diskquota_locks.message_box_lock);
+			LWLockRelease(diskquota_locks.extension_ddl_message_lock);
 		}
 	}
-	LWLockAcquire(diskquota_locks.message_box_lock, LW_SHARED);
-	if (message_box->result != ERR_OK)
+	LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_SHARED);
+	if (extension_ddl_message->result != ERR_OK)
 	{
-		LWLockRelease(diskquota_locks.message_box_lock);
+		LWLockRelease(diskquota_locks.extension_ddl_message_lock);
 		LWLockRelease(diskquota_locks.extension_lock);
-		elog(ERROR, "[diskquota] failed to create diskquota extension: %s", err_code_to_err_message((MessageResult) message_box->result));
+		elog(ERROR, "[diskquota] failed to create diskquota extension: %s", err_code_to_err_message((MessageResult) extension_ddl_message->result));
 	}
-	LWLockRelease(diskquota_locks.message_box_lock);
+	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
 	LWLockRelease(diskquota_locks.extension_lock);
 out:
 	if (next_object_access_hook)

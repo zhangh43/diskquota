@@ -26,7 +26,7 @@ struct DiskQuotaLocks
 {
 	LWLock	   *active_table_lock;
 	LWLock	   *black_map_lock;
-	LWLock	   *message_box_lock;
+	LWLock	   *extension_ddl_message_lock;
 	LWLock	   *extension_lock; /* ensure create diskquota extension serially */
 };
 typedef struct DiskQuotaLocks DiskQuotaLocks;
@@ -41,7 +41,7 @@ typedef struct DiskQuotaLocks DiskQuotaLocks;
  * to stop the diskquota worker process and remove the dbOid from diskquota
  * database_list table as well.
  */
-struct MessageBox
+struct ExtensionDDLMessage
 {
 	int			launcher_pid;	/* diskquota launcher pid */
 	int			req_pid;		/* pid of the QD process which create/drop
@@ -74,12 +74,12 @@ enum MessageResult
 	ERR_UNKNOWN,
 };
 
-typedef struct MessageBox MessageBox;
+typedef struct ExtensionDDLMessage ExtensionDDLMessage;
 typedef enum MessageCommand MessageCommand;
 typedef enum MessageResult MessageResult;
 
 extern DiskQuotaLocks diskquota_locks;
-extern MessageBox *message_box;
+extern ExtensionDDLMessage *extension_ddl_message;
 
 /* enforcement interface*/
 extern void init_disk_quota_enforcement(void);
