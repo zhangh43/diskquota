@@ -185,11 +185,11 @@ disk_quota_shmem_startup(void)
 	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
 
 	init_lwlocks();
-	message_box = ShmemInitStruct("disk_quota_message_box",
-								  sizeof(MessageBox),
+	extension_ddl_message = ShmemInitStruct("disk_quota_extension_ddl_message",
+								  sizeof(ExtensionDDLMessage),
 								  &found);
 	if (!found)
-		memset((void *) message_box, 0, sizeof(MessageBox));
+		memset((void *) extension_ddl_message, 0, sizeof(ExtensionDDLMessage));
 
 	memset(&hash_ctl, 0, sizeof(hash_ctl));
 	hash_ctl.keysize = sizeof(BlackMapEntry);

@@ -641,7 +641,7 @@ disk_quota_launcher_main(Datum main_arg)
 		if (rc & WL_POSTMASTER_DEATH)
 			proc_exit(1);
 
-		/* process extension ddl, now someone is holding message_box_lock */
+		/* process extension ddl, now someone is holding extension_ddl_message_lock */
 		if (got_sigusr1)
 		{
 			got_sigusr1 = false;
@@ -702,7 +702,7 @@ disk_quota_launcher_main(Datum main_arg)
 		if (rc & WL_POSTMASTER_DEATH)
 			proc_exit(1);
 
-		/* process message box, now someone is holding message_box_lock */
+		/* process message box, now someone is holding extension_ddl_message_lock */
 		if (got_sigusr1)
 		{
 			got_sigusr1 = false;
@@ -1138,7 +1138,7 @@ diskquota_start_worker(PG_FUNCTION_ARGS)
 	extension_ddl_message->result = ERR_PENDING;
 	extension_ddl_message->dbid = MyDatabaseId;
 	/* setup sig handler to diskquota launcher process */
-	rc = kill(message_box->launcher_pid, SIGUSR1);
+	rc = kill(extension_ddl_message->launcher_pid, SIGUSR1);
 	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
 	if (rc == 0)
 	{
@@ -1277,7 +1277,7 @@ dq_object_access_hook(ObjectAccessType access, Oid classId,
 	extension_ddl_message->cmd = CMD_DROP_EXTENSION;
 	extension_ddl_message->result = ERR_PENDING;
 	extension_ddl_message->dbid = MyDatabaseId;
-	rc = kill(message_box->launcher_pid, SIGUSR1);
+	rc = kill(extension_ddl_message->launcher_pid, SIGUSR1);
 	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
 	if (rc == 0)
 	{
