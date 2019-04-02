@@ -152,7 +152,7 @@ DiskQuotaShmemSize(void)
 {
 	Size		size;
 
-	size = sizeof(MessageBox);
+	size = sizeof(ExtensionDDLMessage);
 	size = add_size(size, hash_estimate_size(MAX_DISK_QUOTA_BLACK_ENTRIES, sizeof(BlackMapEntry)));
 	size = add_size(size, hash_estimate_size(diskquota_max_active_tables, sizeof(DiskQuotaActiveTableEntry)));
 	return size;
