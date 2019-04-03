@@ -67,6 +67,8 @@ enum MessageResult
 	ERR_EXCEED,
 	/* add the dbid to diskquota_namespace.database_list failed */
 	ERR_ADD_TO_DB,
+	/* delete dbid from diskquota_namespace.database_list failed */
+	ERR_DEL_FROM_DB,
 	/* cann't start worker process */
 	ERR_START_WORKER,
 	/* invalid dbid */
