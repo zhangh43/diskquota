@@ -107,9 +107,7 @@ static int64 get_size_in_mb(char *str);
 static void set_quota_internal(Oid targetoid, int64 quota_limit_mb, QuotaType type);
 static int	start_worker_by_dboid(Oid dbid);
 static void create_monitor_db_table();
-static inline void exec_simple_utility(const char *sql);
-static void exec_simple_spi(const char *sql, int expected_code);
-static bool add_db_to_config(Oid dbid);
+static void add_db_to_config(Oid dbid);
 static void del_db_from_config(Oid dbid);
 static void process_extension_ddl_message(void);
 static void do_process_extension_ddl_message(MessageResult * code, ExtensionDDLMessage local_extension_ddl_message);
@@ -242,7 +240,7 @@ disk_quota_sighup(SIGNAL_ARGS)
 
 /*
  * Signal handler for SIGUSR1
- * Set a flag to tell the launcher to handle message box
+ * Set a flag to tell the launcher to handle extension ddl message
  */
 static void
 disk_quota_sigusr1(SIGNAL_ARGS)
@@ -377,41 +375,20 @@ static void
 create_monitor_db_table()
 {
 	const char *sql;
+	int ret;
 
 	sql = "create schema if not exists diskquota_namespace;"
 		"create table if not exists diskquota_namespace.database_list(dbid oid not null unique);";
 	exec_simple_utility(sql);
-}
 
-static inline void
-exec_simple_utility(const char *sql)
-{
+	/* debug_query_string need to be set for SPI_execute utility functions. */
 	debug_query_string = sql;
-	StartTransactionCommand();
-	exec_simple_spi(sql, SPI_OK_UTILITY);
-	CommitTransactionCommand();
-	debug_query_string = NULL;
-}
-
-/*
- * SPI execute sql interface
- */
-static void
-exec_simple_spi(const char *sql, int expected_code)
-{
-	int			ret;
-
-	ret = SPI_connect();
-	if (ret != SPI_OK_CONNECT)
-		elog(ERROR, "[diskquota] SPI connect error, code=%d", ret);
-	PushActiveSnapshot(GetTransactionSnapshot());
-	ret = SPI_execute(sql, false, 0);
-	if (ret != expected_code)
+	ret = SPI_execute(str.data, false, 0);
+	if (ret != SPI_OK_UTILITY)
 	{
 		elog(ERROR, "[diskquota] SPI_execute sql:'%s', code %d", sql, ret);
 	}
-	SPI_finish();
-	PopActiveSnapshot();
+	debug_query_string = NULL;
 }
 
 static bool
@@ -489,25 +466,37 @@ start_workers_from_dblist()
 
 }
 
-static bool
+static void
 add_db_to_config(Oid dbid)
 {
-	StringInfoData str;
+	StringInfoData	str;
+	int				ret;
 
 	initStringInfo(&str);
 	appendStringInfo(&str, "insert into diskquota_namespace.database_list values(%u);", dbid);
-	exec_simple_spi(str.data, SPI_OK_INSERT);
-	return true;
+
+	ret = SPI_execute(str.data, false, 0);
+	if (ret != SPI_OK_INSERT)
+	{
+		elog(ERROR, "[diskquota] SPI_execute sql:'%s', code %d", sql, ret);
+	}
+	return;
 }
 
 static void
 del_db_from_config(Oid dbid)
 {
-	StringInfoData str;
+	StringInfoData	str;
+	int				ret;
 
 	initStringInfo(&str);
 	appendStringInfo(&str, "delete from diskquota_namespace.database_list where dbid=%u;", dbid);
-	exec_simple_spi(str.data, SPI_OK_DELETE);
+
+	ret = SPI_execute(str.data, false, 0);
+	if (ret != SPI_OK_DELETE)
+	{
+		elog(ERROR, "[diskquota] SPI_execute sql:'%s', code %d", sql, ret);
+	}
 }
 
 /*
@@ -544,12 +533,12 @@ on_add_db(Oid dbid, MessageResult * code)
 	if (num_db >= MAX_NUM_MONITORED_DB)
 	{
 		*code = ERR_EXCEED;
-		elog(ERROR, "[diskquota] too database to monitor");
+		elog(ERROR, "[diskquota launcher] too many databases to monitor");
 	}
 	if (!is_valid_dbid(dbid))
 	{
 		*code = ERR_INVALID_DBID;
-		elog(ERROR, "[diskquota] invalid database oid");
+		elog(ERROR, "[diskquota launcher] invalid database oid");
 	}
 
 	/*
@@ -570,7 +559,7 @@ on_add_db(Oid dbid, MessageResult * code)
 	if (start_worker_by_dboid(dbid) < 1)
 	{
 		*code = ERR_START_WORKER;
-		elog(ERROR, "[diskquota] failed to start worker - dbid=%u", dbid);
+		elog(ERROR, "[diskquota launcher] failed to start worker - dbid=%u", dbid);
 	}
 }
 
@@ -590,7 +579,7 @@ on_del_db(Oid dbid)
 	del_db_from_config(dbid);
 }
 
-/* ---- Functions for lancher process ---- */
+/* ---- Functions for launcher process ---- */
 /*
  * Launcher process manages the worker processes based on
  * GUC diskquota.monitor_databases in configuration file.
@@ -600,72 +589,29 @@ disk_quota_launcher_main(Datum main_arg)
 {
 	HASHCTL		hash_ctl;
 
-	/* Establish signal handlers before unblocking signals. */
+	/* establish signal handlers before unblocking signals. */
 	pqsignal(SIGHUP, disk_quota_sighup);
 	pqsignal(SIGTERM, disk_quota_sigterm);
 	pqsignal(SIGUSR1, disk_quota_sigusr1);
 
-	/* We're now ready to receive signals */
+	/* we're now ready to receive signals */
 	BackgroundWorkerUnblockSignals();
-
-	/*
-	 * diskquota launcher need to access database "diskquota"
-	 * to maintain the databases which enable diskquota
-	 * extension. If database "diskquota" is not created,
-	 * report a warning in log.
-	 */
-	while (!got_sigterm)
-	{
-		int			rc;
-
-		CHECK_FOR_INTERRUPTS();
-
-		/*
-		 * Check whether the state is in ready mode. The state would be
-		 * unknown, when you `create extension diskquota` at the first time.
-		 * After running UDF init_table_size_table() The state will changed to
-		 * be ready.
-		 */
-		if (FindMyDatabase(DISKQUOTA_DB, &MyDatabaseId, &MyDatabaseTableSpace))
-			break;
-		else
-			elog(WARNING,"[diskquota launcher] database diskquota need to be "
-					"created before using diskquota extension.");
-
-		rc = WaitLatch(&MyProc->procLatch,
-					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
-					   diskquota_naptime * 1000L);
-		ResetLatch(&MyProc->procLatch);
-
-		/* emergency bailout if postmaster has died */
-		if (rc & WL_POSTMASTER_DEATH)
-			proc_exit(1);
-
-		/* process extension ddl, now someone is holding extension_ddl_message_lock */
-		if (got_sigusr1)
-		{
-			got_sigusr1 = false;
-			process_extension_ddl_message();
-		}
-
-		/*
-		 * In case of a SIGHUP, just reload the configuration.
-		 */
-		if (got_sighup)
-		{
-			got_sighup = false;
-			ProcessConfigFile(PGC_SIGHUP);
-		}
-	}
 
 	LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_EXCLUSIVE);
 	extension_ddl_message->launcher_pid = MyProcPid;
 	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
-	/* Connect to our database */
+
+	/*
+	 * connect to our database 'diskquota'.
+	 * launcher process will exit if 'diskquota'
+	 * database is not existed.
+	 */
 	BackgroundWorkerInitializeConnection("diskquota", NULL);
 
+	/* use table diskquota_namespace.database_list to store diskquota enabled database.*/
 	create_monitor_db_table();
 
+	/* use disk_quota_worker_map to manage diskquota worker processes. */
 	memset(&hash_ctl, 0, sizeof(hash_ctl));
 	hash_ctl.keysize = sizeof(Oid);
 	hash_ctl.entrysize = sizeof(DiskQuotaWorkerEntry);
@@ -676,11 +622,10 @@ disk_quota_launcher_main(Datum main_arg)
 										&hash_ctl,
 										HASH_ELEM | HASH_FUNCTION);
 
+	/* firstly start worker processes for each databases with diskquota enabled. */
 	start_workers_from_dblist();
 
-	/*
-	 * Main loop: do this until the SIGTERM handler tells us to terminate
-	 */
+	/* main loop: do this until the SIGTERM handler tells us to terminate. */
 	while (!got_sigterm)
 	{
 		int			rc;
@@ -688,7 +633,7 @@ disk_quota_launcher_main(Datum main_arg)
 		CHECK_FOR_INTERRUPTS();
 
 		/*
-		 * Background workers mustn't call usleep() or any direct equivalent:
+		 * background workers mustn't call usleep() or any direct equivalent:
 		 * instead, they may wait on their process latch, which sleeps as
 		 * necessary, but is awakened if postmaster dies.  That way the
 		 * background process goes away immediately in an emergency.
@@ -702,16 +647,14 @@ disk_quota_launcher_main(Datum main_arg)
 		if (rc & WL_POSTMASTER_DEATH)
 			proc_exit(1);
 
-		/* process message box, now someone is holding extension_ddl_message_lock */
+		/* process extension ddl message */
 		if (got_sigusr1)
 		{
 			got_sigusr1 = false;
 			process_extension_ddl_message();
 		}
 
-		/*
-		 * In case of a SIGHUP, just reload the configuration.
-		 */
+		/* in case of a SIGHUP, just reload the configuration. */
 		if (got_sighup)
 		{
 			got_sighup = false;
@@ -1178,9 +1121,29 @@ static void
 do_process_extension_ddl_message(MessageResult * code, ExtensionDDLMessage local_extension_ddl_message)
 {
 	int			old_num_db = num_db;
+	bool			connected = false;
+	bool			pushed_active_snap = false;
+	bool			ret = true;
 
+	StartTransactionCommand();
+
+	/*
+	 * Cache Errors during SPI functions, for example a segment may be down
+	 * and current SPI execute will fail. diskquota launcher process should
+	 * tolerate this kind of errors.
+	 */
 	PG_TRY();
 	{
+		if (SPI_OK_CONNECT != SPI_connect())
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("unable to connect to execute internal query")));
+		}
+		connected = true;
+		PushActiveSnapshot(GetTransactionSnapshot());
+		pushed_active_snap = true;
+
 		switch (local_extension_ddl_message.cmd)
 		{
 			case CMD_CREATE_EXTENSION:
@@ -1205,10 +1168,20 @@ do_process_extension_ddl_message(MessageResult * code, ExtensionDDLMessage local
 		HOLD_INTERRUPTS();
 		EmitErrorReport();
 		FlushErrorState();
-		RESUME_INTERRUPTS();
+		ret = false;
 		num_db = old_num_db;
+		RESUME_INTERRUPTS();
 	}
 	PG_END_TRY();
+
+	if (connected)
+		SPI_finish();
+	if (pushed_active_snap)
+		PopActiveSnapshot();
+	if (ret)
+		CommitTransactionCommand();
+	else
+		AbortCurrentTransaction();
 }
 
 /*
@@ -1232,7 +1205,7 @@ process_extension_ddl_message()
 		return;
 	}
 
-	elog(LOG, "[diskquota]: received create/drop extension diskquota message");
+	elog(LOG, "[diskquota launcher]: received create/drop extension diskquota message");
 	StartTransactionCommand();
 	do_process_extension_ddl_message(&code, local_extension_ddl_message);
 	if (code == ERR_OK)

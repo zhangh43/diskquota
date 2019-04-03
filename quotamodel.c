@@ -1020,20 +1020,6 @@ do_load_quotas(void)
 	QuotaLimitEntry *quota_entry;
 	HASH_SEQ_STATUS iter;
 
-	RangeVar   *rv;
-	Relation	rel;
-
-	rv = makeRangeVar("diskquota", "quota_config", -1);
-	rel = heap_openrv_extended(rv, AccessShareLock, true);
-	if (!rel)
-	{
-		/* configuration table is missing. */
-		elog(ERROR, "[diskquota] configuration table \"quota_config\" is missing in database \"%s\","
-			 " please recreate diskquota extension",
-			 get_database_name(MyDatabaseId));
-	}
-	heap_close(rel, AccessShareLock);
-
 	/*
 	 * TODO: we should skip to reload quota config when there is no change in
 	 * quota.config. A flag in shared memory could be used to detect the quota
