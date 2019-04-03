@@ -100,8 +100,6 @@ void		disk_quota_launcher_main(Datum);
 
 static void disk_quota_sigterm(SIGNAL_ARGS);
 static void disk_quota_sighup(SIGNAL_ARGS);
-static int64 get_size_in_mb(char *str);
-static void set_quota_internal(Oid targetoid, int64 quota_limit_mb, QuotaType type);
 static bool	start_worker_by_dboid(Oid dbid);
 static void start_workers_from_dblist(void);
 static void create_monitor_db_table(void);
@@ -798,37 +796,6 @@ start_worker_by_dboid(Oid dbid)
 	}
 
 	return true;
-}
-
-/* ---- Help Functions to set quota limit. ---- */
-/*
- * Set disk quota limit for role.
- */
-Datum
-set_role_quota(PG_FUNCTION_ARGS)
-{
-	Oid			roleoid;
-	char	   *rolname;
-	char	   *sizestr;
-	int64		quota_limit_mb;
-
-	if (!superuser())
-	{
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("must be superuser to set disk quota limit")));
-	}
-
-	rolname = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	rolname = str_tolower(rolname, strlen(rolname), DEFAULT_COLLATION_OID);
-	roleoid = get_role_oid(rolname, false);
-
-	sizestr = text_to_cstring(PG_GETARG_TEXT_PP(1));
-	sizestr = str_tolower(sizestr, strlen(sizestr), DEFAULT_COLLATION_OID);
-	quota_limit_mb = get_size_in_mb(sizestr);
-
-	set_quota_internal(roleoid, quota_limit_mb, ROLE_QUOTA);
-	PG_RETURN_VOID();
 }
 
 

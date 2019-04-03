@@ -56,6 +56,10 @@ PG_FUNCTION_INFO_V1(set_schema_quota);
 PG_FUNCTION_INFO_V1(set_role_quota);
 PG_FUNCTION_INFO_V1(init_table_size_table);
 
+static int64 get_size_in_mb(char *str);
+static void set_quota_internal(Oid targetoid, int64 quota_limit_mb, QuotaType type);
+
+/* ---- Help Functions to set quota limit. ---- */
 /*
  * init table diskquota.table_size.
  * calculate table size by UDF pg_total_relation_size
@@ -119,6 +123,35 @@ init_table_size_table(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
+/*
+ * Set disk quota limit for role.
+ */
+Datum
+set_role_quota(PG_FUNCTION_ARGS)
+{
+	Oid			roleoid;
+	char	   *rolname;
+	char	   *sizestr;
+	int64		quota_limit_mb;
+
+	if (!superuser())
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to set disk quota limit")));
+	}
+
+	rolname = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	rolname = str_tolower(rolname, strlen(rolname), DEFAULT_COLLATION_OID);
+	roleoid = get_role_oid(rolname, false);
+
+	sizestr = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	sizestr = str_tolower(sizestr, strlen(sizestr), DEFAULT_COLLATION_OID);
+	quota_limit_mb = get_size_in_mb(sizestr);
+
+	set_quota_internal(roleoid, quota_limit_mb, ROLE_QUOTA);
+	PG_RETURN_VOID();
+}
 
 /*
  * Set disk quota limit for schema.
