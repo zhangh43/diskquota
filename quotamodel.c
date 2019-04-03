@@ -363,7 +363,7 @@ check_diskquota_state_is_ready(void)
 	bool		is_ready = false;
 	bool		connected = false;
 	bool		pushed_active_snap = false;
-	bool		error_happens = false;
+	bool		ret = true;
 
 	StartTransactionCommand();
 
@@ -391,7 +391,7 @@ check_diskquota_state_is_ready(void)
 		HOLD_INTERRUPTS();
 		EmitErrorReport();
 		FlushErrorState();
-		error_happens = true;
+		ret = false;
 		/* Now we can allow interrupts again */
 		RESUME_INTERRUPTS();
 	}
@@ -400,7 +400,7 @@ check_diskquota_state_is_ready(void)
 		SPI_finish();
 	if (pushed_active_snap)
 		PopActiveSnapshot();
-	if (error_happens)
+	if (ret)
 		CommitTransactionCommand();
 	else
 		AbortCurrentTransaction();

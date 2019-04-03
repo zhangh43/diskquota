@@ -375,19 +375,59 @@ static void
 create_monitor_db_table()
 {
 	const char *sql;
-	int ret;
+	bool			connected = false;
+	bool			pushed_active_snap = false;
+	bool			ret = true;
 
 	sql = "create schema if not exists diskquota_namespace;"
 		"create table if not exists diskquota_namespace.database_list(dbid oid not null unique);";
-	exec_simple_utility(sql);
 
 	/* debug_query_string need to be set for SPI_execute utility functions. */
 	debug_query_string = sql;
-	ret = SPI_execute(str.data, false, 0);
-	if (ret != SPI_OK_UTILITY)
+
+	StartTransactionCommand();
+	/*
+	 * Cache Errors during SPI functions, for example a segment may be down
+	 * and current SPI execute will fail. diskquota launcher process should
+	 * tolerate this kind of errors.
+	 */
+	PG_TRY();
 	{
-		elog(ERROR, "[diskquota] SPI_execute sql:'%s', code %d", sql, ret);
+		if (SPI_OK_CONNECT != SPI_connect())
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("unable to connect to execute internal query")));
+		}
+		connected = true;
+		PushActiveSnapshot(GetTransactionSnapshot());
+		pushed_active_snap = true;
+
+		if (SPI_execute(sql, false, 0) != SPI_OK_UTILITY)
+		{
+			elog(ERROR, "[diskquota launcher] SPI_execute error, sql:'%s', code %d", sql, ret);
+		}
 	}
+	PG_CATCH();
+	{
+		/* Prevents interrupts while cleaning up */
+		HOLD_INTERRUPTS();
+		EmitErrorReport();
+		FlushErrorState();
+		ret = false;
+		/* Now we can allow interrupts again */
+		RESUME_INTERRUPTS();
+	}
+	PG_END_TRY();
+	if (connected)
+		SPI_finish();
+	if (pushed_active_snap)
+		PopActiveSnapshot();
+	if (ret)
+		CommitTransactionCommand();
+	else
+		AbortCurrentTransaction();
+
 	debug_query_string = NULL;
 }
 
@@ -478,7 +518,7 @@ add_db_to_config(Oid dbid)
 	ret = SPI_execute(str.data, false, 0);
 	if (ret != SPI_OK_INSERT)
 	{
-		elog(ERROR, "[diskquota] SPI_execute sql:'%s', code %d", sql, ret);
+		elog(ERROR, "[diskquota] SPI_execute sql:'%s', code %d", str.data, ret);
 	}
 	return;
 }
@@ -495,7 +535,7 @@ del_db_from_config(Oid dbid)
 	ret = SPI_execute(str.data, false, 0);
 	if (ret != SPI_OK_DELETE)
 	{
-		elog(ERROR, "[diskquota] SPI_execute sql:'%s', code %d", sql, ret);
+		elog(ERROR, "[diskquota] SPI_execute sql:'%s', code %d", str.data, ret);
 	}
 }
 
