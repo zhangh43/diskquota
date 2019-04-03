@@ -52,9 +52,6 @@
 #include "diskquota.h"
 PG_MODULE_MAGIC;
 
-/* timeout count to wait response from launcher process, in 1/10 sec */
-#define WAIT_TIME_COUNT  1200
-
 /* max number of monitored database with diskquota enabled */
 #define MAX_NUM_MONITORED_DB 10
 
@@ -85,7 +82,6 @@ ExtensionDDLMessage *extension_ddl_message = NULL;
 
 /* using hash table to support incremental update the table size entry.*/
 static HTAB *disk_quota_worker_map = NULL;
-static object_access_hook_type next_object_access_hook;
 static int	num_db = 0;
 
 /* functions of disk quota*/
@@ -171,9 +167,9 @@ _PG_init(void)
 	{
 		return;
 	}
+
 	/* Add dq_object_access_hook to handle drop extension event. */
-	next_object_access_hook = object_access_hook;
-	object_access_hook = dq_object_access_hook;
+	add_diskquota_object_access_hook();
 
 	/* set up common data for diskquota launcher worker */
 	worker.bgw_flags = BGWORKER_SHMEM_ACCESS |

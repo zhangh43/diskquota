@@ -27,6 +27,7 @@
 #include "commands/extension.h"
 #include "executor/spi.h"
 #include "nodes/makefuncs.h"
+#include "storage/proc.h"
 #include "tcop/utility.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
@@ -44,7 +45,12 @@ PG_FUNCTION_INFO_V1(diskquota_start_worker);
 PG_FUNCTION_INFO_V1(set_schema_quota);
 PG_FUNCTION_INFO_V1(set_role_quota);
 
-void dq_object_access_hook(ObjectAccessType access, Oid classId,
+/* timeout count to wait response from launcher process, in 1/10 sec */
+#define WAIT_TIME_COUNT  1200
+
+static object_access_hook_type next_object_access_hook;
+
+static void dq_object_access_hook(ObjectAccessType access, Oid classId,
 					  	  Oid objectId, int subId, void *arg);
 static const char *ddl_err_code_to_err_message(MessageResult code);
 static int64 get_size_in_mb(char *str);
@@ -172,6 +178,14 @@ diskquota_start_worker(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
+/*
+ * Add dq_object_access_hook to handle drop extension event.
+ */
+void add_diskquota_object_access_hook()
+{
+	next_object_access_hook = object_access_hook;
+	object_access_hook = dq_object_access_hook;
+}
 
 /*
  * This hook is used to handle drop extension diskquota event
@@ -179,7 +193,7 @@ diskquota_start_worker(PG_FUNCTION_ARGS)
  * Laucher will terminate the corresponding worker process and
  * remove the dbOid from the database_list table.
  */
-void
+static void
 dq_object_access_hook(ObjectAccessType access, Oid classId,
 					  Oid objectId, int subId, void *arg)
 {
