@@ -114,7 +114,7 @@ static void process_extension_ddl_message(void);
 static void do_process_extension_ddl_message(MessageResult * code, ExtensionDDLMessage local_extension_ddl_message);
 static void dq_object_access_hook(ObjectAccessType access, Oid classId,
 					  Oid objectId, int subId, void *arg);
-static const char *err_code_to_err_message(MessageResult code);
+static const char *ddl_err_code_to_err_message(MessageResult code);
 extern void diskquota_invalidate_db(Oid dbid);
 
 /*
@@ -1134,7 +1134,7 @@ get_size_in_mb(char *str)
 }
 
 /*
- * trigger start diskquota worker when create extension diskquota
+ * Trigger start diskquota worker when create extension diskquota
  * This function is called at backend side, and will send message to
  * diskquota launcher. Luacher process is responsible for starting the real
  * diskquota worker process.
@@ -1184,13 +1184,20 @@ diskquota_start_worker(PG_FUNCTION_ARGS)
 	{
 		LWLockRelease(diskquota_locks.extension_ddl_message_lock);
 		LWLockRelease(diskquota_locks.extension_lock);
-		elog(ERROR, "[diskquota] failed to create diskquota extension: %s", err_code_to_err_message((MessageResult) extension_ddl_message->result));
+		elog(ERROR, "[diskquota] failed to create diskquota extension: %s", ddl_err_code_to_err_message((MessageResult) extension_ddl_message->result));
 	}
 	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
 	LWLockRelease(diskquota_locks.extension_lock);
 	PG_RETURN_VOID();
 }
 
+/*
+ * Process 'create extension' and 'drop extension' message.
+ * For 'create extension' message, store dbid into table
+ * 'database_list' and start the diskquota worker process.
+ * For 'drop extension' message, remove dbid from table
+ * 'database_list' and stop the diskquota worker process.
+ */
 static void
 do_process_extension_ddl_message(MessageResult * code, ExtensionDDLMessage local_extension_ddl_message)
 {
@@ -1275,9 +1282,7 @@ process_extension_ddl_message()
 
 	/* create/drop extension message must be valid */
 	if (local_extension_ddl_message.req_pid == 0 || local_extension_ddl_message.launcher_pid != MyProcPid)
-	{
 		return;
-	}
 
 	elog(LOG, "[diskquota launcher]: received create/drop extension diskquota message");
 
@@ -1349,7 +1354,7 @@ dq_object_access_hook(ObjectAccessType access, Oid classId,
 	{
 		LWLockRelease(diskquota_locks.extension_ddl_message_lock);
 		LWLockRelease(diskquota_locks.extension_lock);
-		elog(ERROR, "[diskquota launcher] failed to drop diskquota extension: %s", err_code_to_err_message((MessageResult) extension_ddl_message->result));
+		elog(ERROR, "[diskquota launcher] failed to drop diskquota extension: %s", ddl_err_code_to_err_message((MessageResult) extension_ddl_message->result));
 	}
 	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
 	LWLockRelease(diskquota_locks.extension_lock);
@@ -1359,23 +1364,28 @@ out:
 									subId, arg);
 }
 
+/*
+ * For extension DDL('create extension/drop extension')
+ * Using this function to convert error code from diskquota
+ * launcher to error message and return it to client.
+ */
 static const char *
-err_code_to_err_message(MessageResult code)
+ddl_err_code_to_err_message(MessageResult code)
 {
 	switch (code)
 	{
 		case ERR_PENDING:
-			return "no response from launcher, or timeout";
+			return "no response from diskquota launcher, check whether launcher process exists";
 		case ERR_OK:
-			return "NO ERROR";
+			return "succeeded";
 		case ERR_EXCEED:
-			return "too many database to monitor";
+			return "too many databases to monitor";
 		case ERR_ADD_TO_DB:
 			return "add dbid to database_list failed";
 		case ERR_DEL_FROM_DB:
 			return "delete dbid from database_list failed";
 		case ERR_START_WORKER:
-			return "start worker failed";
+			return "start diskquota worker failed";
 		case ERR_INVALID_DBID:
 			return "invalid dbid";
 		default:
