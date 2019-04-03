@@ -105,9 +105,9 @@ static void disk_quota_sigterm(SIGNAL_ARGS);
 static void disk_quota_sighup(SIGNAL_ARGS);
 static int64 get_size_in_mb(char *str);
 static void set_quota_internal(Oid targetoid, int64 quota_limit_mb, QuotaType type);
-static int	start_worker_by_dboid(Oid dbid);
-static void start_workers_from_dblist();
-static void create_monitor_db_table();
+static bool	start_worker_by_dboid(Oid dbid);
+static void start_workers_from_dblist(void);
+static void create_monitor_db_table(void);
 static void add_dbid_to_database_list(Oid dbid);
 static void del_dbid_from_database_list(Oid dbid);
 static void process_extension_ddl_message(void);
@@ -393,7 +393,7 @@ disk_quota_launcher_main(Datum main_arg)
 	 * launcher process will exit if 'diskquota'
 	 * database is not existed.
 	 */
-	BackgroundWorkerInitializeConnection("diskquota", NULL);
+	BackgroundWorkerInitializeConnection(DISKQUOTA_DB, NULL);
 
 	/* use table diskquota_namespace.database_list to store diskquota enabled database.*/
 	create_monitor_db_table();
@@ -454,7 +454,7 @@ disk_quota_launcher_main(Datum main_arg)
 
 
 /**
- * create table to record the list of monitored databases
+ * Create table to record the list of monitored databases
  * we need a place to store the database with diskquota enabled
  * (via CREATE EXTENSION diskquota). Currently, we store them into
  * heap table in diskquota_namespace schema of diskquota database.
@@ -462,7 +462,7 @@ disk_quota_launcher_main(Datum main_arg)
  * for these databases.
  */
 static void
-create_monitor_db_table()
+create_monitor_db_table(void)
 {
 	const char *sql;
 	bool			connected = false;
@@ -536,15 +536,13 @@ is_valid_dbid(Oid dbid)
 }
 
 /*
- * in early stage, start all worker processes of diskquota-enabled databases
- * from diskquota_namespace.database_list
+ * When launcher started, it will start all worker processes of
+ * diskquota-enabled databases from diskquota_namespace.database_list
  */
 static void
-start_workers_from_dblist()
+start_workers_from_dblist(void)
 {
 	TupleDesc	tupdesc;
-	Oid			fake_dbid[128];
-	int			fake_count = 0;
 	int			num = 0;
 	int			ret;
 	int			i;
@@ -579,13 +577,13 @@ start_workers_from_dblist()
 			elog(ERROR, "[diskquota launcher] dbid cann't be null in table database_list");
 		dbid = DatumGetObjectId(dat);
 		if (!is_valid_dbid(dbid))
-		{
-			fake_dbid[fake_count++] = dbid;
 			continue;
-		}
-		if (start_worker_by_dboid(dbid) < 1)
+		if (!start_worker_by_dboid(dbid))
 			elog(ERROR, "[diskquota launcher] start worker process of database(%u) failed", dbid);
 		num++;
+		/* diskquota only supports to monitor at most MAX_NUM_MONITORED_DB databases */
+		if( num >= MAX_NUM_MONITORED_DB)
+			break;
 	}
 	num_db = num;
 	SPI_finish();
@@ -593,7 +591,6 @@ start_workers_from_dblist()
 	CommitTransactionCommand();
 
 	/* TODO: clean invalid database */
-
 }
 
 /*
@@ -664,7 +661,7 @@ try_kill_db_worker(Oid dbid)
 }
 
 /*
- * handle create extension diskquota
+ * Handle create extension diskquota
  * if we know the exact error which caused failure,
  * we set it, and error out
  */
@@ -697,7 +694,7 @@ on_add_db(Oid dbid, MessageResult * code)
 	}
 	PG_END_TRY();
 
-	if (start_worker_by_dboid(dbid) < 1)
+	if (!start_worker_by_dboid(dbid))
 	{
 		*code = ERR_START_WORKER;
 		elog(ERROR, "[diskquota launcher] failed to start worker - dbid=%u", dbid);
@@ -705,7 +702,7 @@ on_add_db(Oid dbid, MessageResult * code)
 }
 
 /*
- * handle message: drop extension diskquota
+ * Handle message: drop extension diskquota
  * do our best to:
  * 1. kill the associated worker process
  * 2. delete dbid from diskquota_namespace.database_list
@@ -742,18 +739,20 @@ on_del_db(Oid dbid, MessageResult * code)
 
 /*
  * Dynamically launch an disk quota worker process.
+ * This function is called when laucher process receive
+ * a 'create extension diskquota' message.
  */
-static int
+static bool
 start_worker_by_dboid(Oid dbid)
 {
-	BackgroundWorker worker;
-	BackgroundWorkerHandle *handle;
-	BgwHandleStatus status;
-	MemoryContext old_ctx;
-	char	   *dbname;
+	BackgroundWorker			worker;
+	BackgroundWorkerHandle  *handle;
+	BgwHandleStatus 			status;
+	MemoryContext 			old_ctx;
+	char	   				   *dbname;
 	pid_t		pid;
 	bool		found;
-	bool		ok;
+	bool		ret;
 	DiskQuotaWorkerEntry *workerentry;
 
 	memset(&worker, 0, sizeof(BackgroundWorker));
@@ -773,10 +772,10 @@ start_worker_by_dboid(Oid dbid)
 	worker.bgw_main_arg = (Datum) 0;
 
 	old_ctx = MemoryContextSwitchTo(TopMemoryContext);
-	ok = RegisterDynamicBackgroundWorker(&worker, &handle);
+	ret = RegisterDynamicBackgroundWorker(&worker, &handle);
 	MemoryContextSwitchTo(old_ctx);
-	if (!ok)
-		return -1;
+	if (!ret)
+		return false;
 	status = WaitForBackgroundWorkerStartup(handle, &pid);
 	if (status == BGWH_STOPPED)
 		ereport(ERROR,
@@ -801,7 +800,7 @@ start_worker_by_dboid(Oid dbid)
 		workerentry->pid = pid;
 	}
 
-	return pid;
+	return true;
 }
 
 /* ---- Help Functions to set quota limit. ---- */
