@@ -106,6 +106,7 @@ static void disk_quota_sighup(SIGNAL_ARGS);
 static int64 get_size_in_mb(char *str);
 static void set_quota_internal(Oid targetoid, int64 quota_limit_mb, QuotaType type);
 static int	start_worker_by_dboid(Oid dbid);
+static void start_workers_from_dblist();
 static void create_monitor_db_table();
 static void add_dbid_to_database_list(Oid dbid);
 static void del_dbid_from_database_list(Oid dbid);
@@ -711,7 +712,7 @@ on_add_db(Oid dbid, MessageResult * code)
  * 3. invalidate black-map entries from shared memory
  */
 static void
-on_del_db(Oid dbid)
+on_del_db(Oid dbid, MessageResult * code)
 {
 	if (!is_valid_dbid(dbid))
 	{
@@ -1226,7 +1227,7 @@ do_process_extension_ddl_message(MessageResult * code, ExtensionDDLMessage local
 				*code = ERR_OK;
 				break;
 			case CMD_DROP_EXTENSION:
-				on_del_db(local_extension_ddl_message.dbid);
+				on_del_db(local_extension_ddl_message.dbid, code);
 				num_db--;
 				*code = ERR_OK;
 				break;
