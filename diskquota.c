@@ -107,8 +107,8 @@ static int64 get_size_in_mb(char *str);
 static void set_quota_internal(Oid targetoid, int64 quota_limit_mb, QuotaType type);
 static int	start_worker_by_dboid(Oid dbid);
 static void create_monitor_db_table();
-static void add_db_to_config(Oid dbid);
-static void del_db_from_config(Oid dbid);
+static void add_dbid_to_database_list(Oid dbid);
+static void del_dbid_from_database_list(Oid dbid);
 static void process_extension_ddl_message(void);
 static void do_process_extension_ddl_message(MessageResult * code, ExtensionDDLMessage local_extension_ddl_message);
 static void dq_object_access_hook(ObjectAccessType access, Oid classId,
@@ -363,12 +363,101 @@ disk_quota_worker_main(Datum main_arg)
 	proc_exit(0);
 }
 
+
+
+/* ---- Functions for launcher process ---- */
+/*
+ * Launcher process manages the worker processes based on
+ * GUC diskquota.monitor_databases in configuration file.
+ */
+void
+disk_quota_launcher_main(Datum main_arg)
+{
+	HASHCTL		hash_ctl;
+
+	/* establish signal handlers before unblocking signals. */
+	pqsignal(SIGHUP, disk_quota_sighup);
+	pqsignal(SIGTERM, disk_quota_sigterm);
+	pqsignal(SIGUSR1, disk_quota_sigusr1);
+
+	/* we're now ready to receive signals */
+	BackgroundWorkerUnblockSignals();
+
+	LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_EXCLUSIVE);
+	extension_ddl_message->launcher_pid = MyProcPid;
+	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
+
+	/*
+	 * connect to our database 'diskquota'.
+	 * launcher process will exit if 'diskquota'
+	 * database is not existed.
+	 */
+	BackgroundWorkerInitializeConnection("diskquota", NULL);
+
+	/* use table diskquota_namespace.database_list to store diskquota enabled database.*/
+	create_monitor_db_table();
+
+	/* use disk_quota_worker_map to manage diskquota worker processes. */
+	memset(&hash_ctl, 0, sizeof(hash_ctl));
+	hash_ctl.keysize = sizeof(Oid);
+	hash_ctl.entrysize = sizeof(DiskQuotaWorkerEntry);
+	hash_ctl.hash = oid_hash;
+
+	disk_quota_worker_map = hash_create("disk quota worker map",
+										1024,
+										&hash_ctl,
+										HASH_ELEM | HASH_FUNCTION);
+
+	/* firstly start worker processes for each databases with diskquota enabled. */
+	start_workers_from_dblist();
+
+	/* main loop: do this until the SIGTERM handler tells us to terminate. */
+	while (!got_sigterm)
+	{
+		int			rc;
+
+		CHECK_FOR_INTERRUPTS();
+
+		/*
+		 * background workers mustn't call usleep() or any direct equivalent:
+		 * instead, they may wait on their process latch, which sleeps as
+		 * necessary, but is awakened if postmaster dies.  That way the
+		 * background process goes away immediately in an emergency.
+		 */
+		rc = WaitLatch(&MyProc->procLatch,
+					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
+					   diskquota_naptime * 1000L);
+		ResetLatch(&MyProc->procLatch);
+
+		/* emergency bailout if postmaster has died */
+		if (rc & WL_POSTMASTER_DEATH)
+			proc_exit(1);
+
+		/* process extension ddl message */
+		if (got_sigusr1)
+		{
+			got_sigusr1 = false;
+			process_extension_ddl_message();
+		}
+
+		/* in case of a SIGHUP, just reload the configuration. */
+		if (got_sighup)
+		{
+			got_sighup = false;
+			ProcessConfigFile(PGC_SIGHUP);
+		}
+	}
+
+	proc_exit(1);
+}
+
+
 /**
  * create table to record the list of monitored databases
  * we need a place to store the database with diskquota enabled
  * (via CREATE EXTENSION diskquota). Currently, we store them into
  * heap table in diskquota_namespace schema of diskquota database.
- * When database restarted, diskquota laucher will start worker processes
+ * When database restarted, diskquota launcher will start worker processes
  * for these databases.
  */
 static void
@@ -506,8 +595,13 @@ start_workers_from_dblist()
 
 }
 
+/*
+ * Add the database id into table 'database_list' in
+ * database 'diskquota' to store the diskquota enabled
+ * database info.
+ */
 static void
-add_db_to_config(Oid dbid)
+add_dbid_to_database_list(Oid dbid)
 {
 	StringInfoData	str;
 	int				ret;
@@ -515,6 +609,7 @@ add_db_to_config(Oid dbid)
 	initStringInfo(&str);
 	appendStringInfo(&str, "insert into diskquota_namespace.database_list values(%u);", dbid);
 
+	/* errors will be cached in outer function */
 	ret = SPI_execute(str.data, false, 0);
 	if (ret != SPI_OK_INSERT)
 	{
@@ -523,8 +618,12 @@ add_db_to_config(Oid dbid)
 	return;
 }
 
+/*
+ * Delete database id from table 'database_list' in
+ * database 'diskquota'.
+ */
 static void
-del_db_from_config(Oid dbid)
+del_dbid_from_database_list(Oid dbid)
 {
 	StringInfoData	str;
 	int				ret;
@@ -532,6 +631,7 @@ del_db_from_config(Oid dbid)
 	initStringInfo(&str);
 	appendStringInfo(&str, "delete from diskquota_namespace.database_list where dbid=%u;", dbid);
 
+	/* errors will be cached in outer function */
 	ret = SPI_execute(str.data, false, 0);
 	if (ret != SPI_OK_DELETE)
 	{
@@ -587,7 +687,7 @@ on_add_db(Oid dbid, MessageResult * code)
 	 */
 	PG_TRY();
 	{
-		add_db_to_config(dbid);
+		add_dbid_to_database_list(dbid);
 	}
 	PG_CATCH();
 	{
@@ -613,96 +713,30 @@ on_add_db(Oid dbid, MessageResult * code)
 static void
 on_del_db(Oid dbid)
 {
-	if (dbid == InvalidOid)
-		return;
-	try_kill_db_worker(dbid);
-	del_db_from_config(dbid);
-}
-
-/* ---- Functions for launcher process ---- */
-/*
- * Launcher process manages the worker processes based on
- * GUC diskquota.monitor_databases in configuration file.
- */
-void
-disk_quota_launcher_main(Datum main_arg)
-{
-	HASHCTL		hash_ctl;
-
-	/* establish signal handlers before unblocking signals. */
-	pqsignal(SIGHUP, disk_quota_sighup);
-	pqsignal(SIGTERM, disk_quota_sigterm);
-	pqsignal(SIGUSR1, disk_quota_sigusr1);
-
-	/* we're now ready to receive signals */
-	BackgroundWorkerUnblockSignals();
-
-	LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_EXCLUSIVE);
-	extension_ddl_message->launcher_pid = MyProcPid;
-	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
-
-	/*
-	 * connect to our database 'diskquota'.
-	 * launcher process will exit if 'diskquota'
-	 * database is not existed.
-	 */
-	BackgroundWorkerInitializeConnection("diskquota", NULL);
-
-	/* use table diskquota_namespace.database_list to store diskquota enabled database.*/
-	create_monitor_db_table();
-
-	/* use disk_quota_worker_map to manage diskquota worker processes. */
-	memset(&hash_ctl, 0, sizeof(hash_ctl));
-	hash_ctl.keysize = sizeof(Oid);
-	hash_ctl.entrysize = sizeof(DiskQuotaWorkerEntry);
-	hash_ctl.hash = oid_hash;
-
-	disk_quota_worker_map = hash_create("disk quota worker map",
-										1024,
-										&hash_ctl,
-										HASH_ELEM | HASH_FUNCTION);
-
-	/* firstly start worker processes for each databases with diskquota enabled. */
-	start_workers_from_dblist();
-
-	/* main loop: do this until the SIGTERM handler tells us to terminate. */
-	while (!got_sigterm)
+	if (!is_valid_dbid(dbid))
 	{
-		int			rc;
-
-		CHECK_FOR_INTERRUPTS();
-
-		/*
-		 * background workers mustn't call usleep() or any direct equivalent:
-		 * instead, they may wait on their process latch, which sleeps as
-		 * necessary, but is awakened if postmaster dies.  That way the
-		 * background process goes away immediately in an emergency.
-		 */
-		rc = WaitLatch(&MyProc->procLatch,
-					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
-					   diskquota_naptime * 1000L);
-		ResetLatch(&MyProc->procLatch);
-
-		/* emergency bailout if postmaster has died */
-		if (rc & WL_POSTMASTER_DEATH)
-			proc_exit(1);
-
-		/* process extension ddl message */
-		if (got_sigusr1)
-		{
-			got_sigusr1 = false;
-			process_extension_ddl_message();
-		}
-
-		/* in case of a SIGHUP, just reload the configuration. */
-		if (got_sighup)
-		{
-			got_sighup = false;
-			ProcessConfigFile(PGC_SIGHUP);
-		}
+		*code = ERR_INVALID_DBID;
+		elog(ERROR, "[diskquota launcher] invalid database oid");
 	}
 
-	proc_exit(1);
+	/* tell postmaster to stop this bgworker */
+	try_kill_db_worker(dbid);
+
+	/*
+	 * delete dbid from diskquota_namespace.database_list
+	 * set *code to ERR_DEL_FROM_DB if any error occurs
+	 */
+	PG_TRY();
+	{
+		del_dbid_from_database_list(dbid);
+	}
+	PG_CATCH();
+	{
+		*code = ERR_DEL_FROM_DB;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
 }
 
 /*
@@ -1246,12 +1280,8 @@ process_extension_ddl_message()
 	}
 
 	elog(LOG, "[diskquota launcher]: received create/drop extension diskquota message");
-	StartTransactionCommand();
+
 	do_process_extension_ddl_message(&code, local_extension_ddl_message);
-	if (code == ERR_OK)
-		CommitTransactionCommand();
-	else
-		AbortCurrentTransaction();
 
 	/* Send createdrop extension diskquota result back to QD */
 	LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_EXCLUSIVE);
@@ -1319,7 +1349,7 @@ dq_object_access_hook(ObjectAccessType access, Oid classId,
 	{
 		LWLockRelease(diskquota_locks.extension_ddl_message_lock);
 		LWLockRelease(diskquota_locks.extension_lock);
-		elog(ERROR, "[diskquota] failed to create diskquota extension: %s", err_code_to_err_message((MessageResult) extension_ddl_message->result));
+		elog(ERROR, "[diskquota launcher] failed to drop diskquota extension: %s", err_code_to_err_message((MessageResult) extension_ddl_message->result));
 	}
 	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
 	LWLockRelease(diskquota_locks.extension_lock);
@@ -1342,6 +1372,8 @@ err_code_to_err_message(MessageResult code)
 			return "too many database to monitor";
 		case ERR_ADD_TO_DB:
 			return "add dbid to database_list failed";
+		case ERR_DEL_FROM_DB:
+			return "delete dbid from database_list failed";
 		case ERR_START_WORKER:
 			return "start worker failed";
 		case ERR_INVALID_DBID:
