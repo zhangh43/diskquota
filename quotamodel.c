@@ -1182,7 +1182,7 @@ quota_check_common(Oid reloid)
  * invalidate all black entry with a specific dbid in SHM
  */
 void
-diskquota_invalidate_db(Oid dbid)
+invalidate_database_blackmap(Oid dbid)
 {
 	BlackMapEntry *entry;
 	HASH_SEQ_STATUS iter;

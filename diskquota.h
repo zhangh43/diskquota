@@ -88,7 +88,7 @@ extern void add_diskquota_object_access_hook(void);
 
 /* enforcement interface*/
 extern void init_disk_quota_enforcement(void);
-extern void diskquota_invalidate_db(Oid dbid);
+extern void invalidate_database_blackmap(Oid dbid);
 
 /* quota model interface*/
 extern void init_disk_quota_shmem(void);

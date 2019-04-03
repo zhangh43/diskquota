@@ -100,7 +100,7 @@ static void del_dbid_from_database_list(Oid dbid);
 static void process_extension_ddl_message(void);
 static void do_process_extension_ddl_message(MessageResult * code,
 					ExtensionDDLMessage local_extension_ddl_message);
-extern void diskquota_invalidate_db(Oid dbid);
+extern void invalidate_database_blackmap(Oid dbid);
 
 /*
  * Entrypoint of diskquota module.
@@ -345,7 +345,7 @@ disk_quota_worker_main(Datum main_arg)
 		}
 	}
 
-	diskquota_invalidate_db(MyDatabaseId);
+	invalidate_database_blackmap(MyDatabaseId);
 	proc_exit(0);
 }
 
@@ -438,7 +438,7 @@ disk_quota_launcher_main(Datum main_arg)
 }
 
 
-/**
+/*
  * Create table to record the list of monitored databases
  * we need a place to store the database with diskquota enabled
  * (via CREATE EXTENSION diskquota). Currently, we store them into
@@ -506,20 +506,6 @@ create_monitor_db_table(void)
 	debug_query_string = NULL;
 }
 
-static bool
-is_valid_dbid(Oid dbid)
-{
-	HeapTuple	tuple;
-
-	if (dbid == InvalidOid)
-		return false;
-	tuple = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(dbid));
-	if (!HeapTupleIsValid(tuple))
-		return false;
-	ReleaseSysCache(tuple);
-	return true;
-}
-
 /*
  * When launcher started, it will start all worker processes of
  * diskquota-enabled databases from diskquota_namespace.database_list
@@ -579,70 +565,109 @@ start_workers_from_dblist(void)
 }
 
 /*
- * Add the database id into table 'database_list' in
- * database 'diskquota' to store the diskquota enabled
- * database info.
+ * This function is called by launcher process to handle message from other backend
+ * processes which call CREATE/DROP EXTENSION diskquota; It must be able to catch errors,
+ * and return an error code back to the backend process.
  */
 static void
-add_dbid_to_database_list(Oid dbid)
+process_extension_ddl_message()
 {
-	StringInfoData	str;
-	int				ret;
+	MessageResult code = ERR_UNKNOWN;
+	ExtensionDDLMessage	local_extension_ddl_message;
 
-	initStringInfo(&str);
-	appendStringInfo(&str, "insert into diskquota_namespace.database_list values(%u);", dbid);
+	LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_SHARED);
+	memcpy(&local_extension_ddl_message, extension_ddl_message, sizeof(ExtensionDDLMessage));
+	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
 
-	/* errors will be cached in outer function */
-	ret = SPI_execute(str.data, false, 0);
-	if (ret != SPI_OK_INSERT)
-	{
-		elog(ERROR, "[diskquota] SPI_execute sql:'%s', code %d", str.data, ret);
-	}
-	return;
+	/* create/drop extension message must be valid */
+	if (local_extension_ddl_message.req_pid == 0 || local_extension_ddl_message.launcher_pid != MyProcPid)
+		return;
+
+	elog(LOG, "[diskquota launcher]: received create/drop extension diskquota message");
+
+	do_process_extension_ddl_message(&code, local_extension_ddl_message);
+
+	/* Send createdrop extension diskquota result back to QD */
+	LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_EXCLUSIVE);
+	memset(extension_ddl_message, 0, sizeof(ExtensionDDLMessage));
+	extension_ddl_message->launcher_pid = MyProcPid;
+	extension_ddl_message->result = (int) code;
+	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
 }
 
-/*
- * Delete database id from table 'database_list' in
- * database 'diskquota'.
- */
-static void
-del_dbid_from_database_list(Oid dbid)
-{
-	StringInfoData	str;
-	int				ret;
-
-	initStringInfo(&str);
-	appendStringInfo(&str, "delete from diskquota_namespace.database_list where dbid=%u;", dbid);
-
-	/* errors will be cached in outer function */
-	ret = SPI_execute(str.data, false, 0);
-	if (ret != SPI_OK_DELETE)
-	{
-		elog(ERROR, "[diskquota] SPI_execute sql:'%s', code %d", str.data, ret);
-	}
-}
 
 /*
- * When drop exention database, diskquota laucher will receive a message
- * to kill the diskquota worker process which monitoring the target database.
+ * Process 'create extension' and 'drop extension' message.
+ * For 'create extension' message, store dbid into table
+ * 'database_list' and start the diskquota worker process.
+ * For 'drop extension' message, remove dbid from table
+ * 'database_list' and stop the diskquota worker process.
  */
 static void
-try_kill_db_worker(Oid dbid)
+do_process_extension_ddl_message(MessageResult * code, ExtensionDDLMessage local_extension_ddl_message)
 {
-	DiskQuotaWorkerEntry *hash_entry;
-	bool		found;
+	int			old_num_db = num_db;
+	bool			connected = false;
+	bool			pushed_active_snap = false;
+	bool			ret = true;
 
-	hash_entry = (DiskQuotaWorkerEntry *) hash_search(disk_quota_worker_map,
-													  (void *) &dbid,
-													  HASH_REMOVE, &found);
-	if (found)
+	StartTransactionCommand();
+
+	/*
+	 * Cache Errors during SPI functions, for example a segment may be down
+	 * and current SPI execute will fail. diskquota launcher process should
+	 * tolerate this kind of errors.
+	 */
+	PG_TRY();
 	{
-		BackgroundWorkerHandle *handle;
+		if (SPI_OK_CONNECT != SPI_connect())
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("unable to connect to execute internal query")));
+		}
+		connected = true;
+		PushActiveSnapshot(GetTransactionSnapshot());
+		pushed_active_snap = true;
 
-		handle = hash_entry->handle;
-		TerminateBackgroundWorker(handle);
-		pfree(handle);
+		switch (local_extension_ddl_message.cmd)
+		{
+			case CMD_CREATE_EXTENSION:
+				on_add_db(local_extension_ddl_message.dbid, code);
+				num_db++;
+				*code = ERR_OK;
+				break;
+			case CMD_DROP_EXTENSION:
+				on_del_db(local_extension_ddl_message.dbid, code);
+				num_db--;
+				*code = ERR_OK;
+				break;
+			default:
+				elog(LOG, "[diskquota]:received unsupported message cmd=%d", local_extension_ddl_message.cmd);
+				*code = ERR_UNKNOWN;
+				break;
+		}
 	}
+	PG_CATCH();
+	{
+		error_context_stack = NULL;
+		HOLD_INTERRUPTS();
+		EmitErrorReport();
+		FlushErrorState();
+		ret = false;
+		num_db = old_num_db;
+		RESUME_INTERRUPTS();
+	}
+	PG_END_TRY();
+
+	if (connected)
+		SPI_finish();
+	if (pushed_active_snap)
+		PopActiveSnapshot();
+	if (ret)
+		CommitTransactionCommand();
+	else
+		AbortCurrentTransaction();
 }
 
 /*
@@ -723,6 +748,75 @@ on_del_db(Oid dbid, MessageResult * code)
 }
 
 /*
+ * Add the database id into table 'database_list' in
+ * database 'diskquota' to store the diskquota enabled
+ * database info.
+ */
+static void
+add_dbid_to_database_list(Oid dbid)
+{
+	StringInfoData	str;
+	int				ret;
+
+	initStringInfo(&str);
+	appendStringInfo(&str, "insert into diskquota_namespace.database_list values(%u);", dbid);
+
+	/* errors will be cached in outer function */
+	ret = SPI_execute(str.data, false, 0);
+	if (ret != SPI_OK_INSERT)
+	{
+		elog(ERROR, "[diskquota] SPI_execute sql:'%s', code %d", str.data, ret);
+	}
+	return;
+}
+
+/*
+ * Delete database id from table 'database_list' in
+ * database 'diskquota'.
+ */
+static void
+del_dbid_from_database_list(Oid dbid)
+{
+	StringInfoData	str;
+	int				ret;
+
+	initStringInfo(&str);
+	appendStringInfo(&str, "delete from diskquota_namespace.database_list where dbid=%u;", dbid);
+
+	/* errors will be cached in outer function */
+	ret = SPI_execute(str.data, false, 0);
+	if (ret != SPI_OK_DELETE)
+	{
+		elog(ERROR, "[diskquota] SPI_execute sql:'%s', code %d", str.data, ret);
+	}
+}
+
+/*
+ * When drop exention database, diskquota laucher will receive a message
+ * to kill the diskquota worker process which monitoring the target database.
+ */
+static void
+try_kill_db_worker(Oid dbid)
+{
+	DiskQuotaWorkerEntry *hash_entry;
+	bool		found;
+
+	hash_entry = (DiskQuotaWorkerEntry *) hash_search(disk_quota_worker_map,
+													  (void *) &dbid,
+													  HASH_REMOVE, &found);
+	if (found)
+	{
+		BackgroundWorkerHandle *handle;
+
+		handle = hash_entry->handle;
+		TerminateBackgroundWorker(handle);
+		pfree(handle);
+	}
+}
+
+
+
+/*
  * Dynamically launch an disk quota worker process.
  * This function is called when laucher process receive
  * a 'create extension diskquota' message.
@@ -789,106 +883,18 @@ start_worker_by_dboid(Oid dbid)
 }
 
 /*
- * Process 'create extension' and 'drop extension' message.
- * For 'create extension' message, store dbid into table
- * 'database_list' and start the diskquota worker process.
- * For 'drop extension' message, remove dbid from table
- * 'database_list' and stop the diskquota worker process.
+ * Check whether db oid is valid.
  */
-static void
-do_process_extension_ddl_message(MessageResult * code, ExtensionDDLMessage local_extension_ddl_message)
+static bool
+is_valid_dbid(Oid dbid)
 {
-	int			old_num_db = num_db;
-	bool			connected = false;
-	bool			pushed_active_snap = false;
-	bool			ret = true;
+	HeapTuple	tuple;
 
-	StartTransactionCommand();
-
-	/*
-	 * Cache Errors during SPI functions, for example a segment may be down
-	 * and current SPI execute will fail. diskquota launcher process should
-	 * tolerate this kind of errors.
-	 */
-	PG_TRY();
-	{
-		if (SPI_OK_CONNECT != SPI_connect())
-		{
-			ereport(ERROR,
-					(errcode(ERRCODE_INTERNAL_ERROR),
-					 errmsg("unable to connect to execute internal query")));
-		}
-		connected = true;
-		PushActiveSnapshot(GetTransactionSnapshot());
-		pushed_active_snap = true;
-
-		switch (local_extension_ddl_message.cmd)
-		{
-			case CMD_CREATE_EXTENSION:
-				on_add_db(local_extension_ddl_message.dbid, code);
-				num_db++;
-				*code = ERR_OK;
-				break;
-			case CMD_DROP_EXTENSION:
-				on_del_db(local_extension_ddl_message.dbid, code);
-				num_db--;
-				*code = ERR_OK;
-				break;
-			default:
-				elog(LOG, "[diskquota]:received unsupported message cmd=%d", local_extension_ddl_message.cmd);
-				*code = ERR_UNKNOWN;
-				break;
-		}
-	}
-	PG_CATCH();
-	{
-		error_context_stack = NULL;
-		HOLD_INTERRUPTS();
-		EmitErrorReport();
-		FlushErrorState();
-		ret = false;
-		num_db = old_num_db;
-		RESUME_INTERRUPTS();
-	}
-	PG_END_TRY();
-
-	if (connected)
-		SPI_finish();
-	if (pushed_active_snap)
-		PopActiveSnapshot();
-	if (ret)
-		CommitTransactionCommand();
-	else
-		AbortCurrentTransaction();
-}
-
-/*
- * this function is called by launcher process to handle message from other backend
- * processes which call CREATE/DROP EXTENSION diskquota; It must be able to catch errors,
- * and return an error code back to the backend process.
- */
-static void
-process_extension_ddl_message()
-{
-	MessageResult code = ERR_UNKNOWN;
-	ExtensionDDLMessage	local_extension_ddl_message;
-
-	LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_SHARED);
-	memcpy(&local_extension_ddl_message, extension_ddl_message, sizeof(ExtensionDDLMessage));
-	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
-
-	/* create/drop extension message must be valid */
-	if (local_extension_ddl_message.req_pid == 0 || local_extension_ddl_message.launcher_pid != MyProcPid)
-		return;
-
-	elog(LOG, "[diskquota launcher]: received create/drop extension diskquota message");
-
-	do_process_extension_ddl_message(&code, local_extension_ddl_message);
-
-	/* Send createdrop extension diskquota result back to QD */
-	LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_EXCLUSIVE);
-	memset(extension_ddl_message, 0, sizeof(ExtensionDDLMessage));
-	extension_ddl_message->launcher_pid = MyProcPid;
-	extension_ddl_message->result = (int) code;
-	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
+	if (dbid == InvalidOid)
+		return false;
+	tuple = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(dbid));
+	if (!HeapTupleIsValid(tuple))
+		return false;
+	ReleaseSysCache(tuple);
+	return true;
 }
