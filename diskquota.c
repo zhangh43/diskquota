@@ -22,7 +22,6 @@
 #include "access/xact.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
-#include "catalog/objectaccess.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_extension.h"
@@ -52,9 +51,6 @@
 #include "gp_activetable.h"
 #include "diskquota.h"
 PG_MODULE_MAGIC;
-
-/* disk quota helper function */
-PG_FUNCTION_INFO_V1(diskquota_start_worker);
 
 /* timeout count to wait response from launcher process, in 1/10 sec */
 #define WAIT_TIME_COUNT  1200
@@ -106,10 +102,8 @@ static void create_monitor_db_table(void);
 static void add_dbid_to_database_list(Oid dbid);
 static void del_dbid_from_database_list(Oid dbid);
 static void process_extension_ddl_message(void);
-static void do_process_extension_ddl_message(MessageResult * code, ExtensionDDLMessage local_extension_ddl_message);
-static void dq_object_access_hook(ObjectAccessType access, Oid classId,
-					  Oid objectId, int subId, void *arg);
-static const char *ddl_err_code_to_err_message(MessageResult code);
+static void do_process_extension_ddl_message(MessageResult * code,
+					ExtensionDDLMessage local_extension_ddl_message);
 extern void diskquota_invalidate_db(Oid dbid);
 
 /*
@@ -798,65 +792,6 @@ start_worker_by_dboid(Oid dbid)
 	return true;
 }
 
-
-/*
- * Trigger start diskquota worker when create extension diskquota
- * This function is called at backend side, and will send message to
- * diskquota launcher. Luacher process is responsible for starting the real
- * diskquota worker process.
- */
-Datum
-diskquota_start_worker(PG_FUNCTION_ARGS)
-{
-	int			rc;
-
-	/*
-	 * Lock on extension_lock to avoid multiple backend create diskquota
-	 * extension at the same time.
-	 */
-	LWLockAcquire(diskquota_locks.extension_lock, LW_EXCLUSIVE);
-	LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_EXCLUSIVE);
-	extension_ddl_message->req_pid = MyProcPid;
-	extension_ddl_message->cmd = CMD_CREATE_EXTENSION;
-	extension_ddl_message->result = ERR_PENDING;
-	extension_ddl_message->dbid = MyDatabaseId;
-	/* setup sig handler to diskquota launcher process */
-	rc = kill(extension_ddl_message->launcher_pid, SIGUSR1);
-	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
-	if (rc == 0)
-	{
-		int			count = WAIT_TIME_COUNT;
-
-		while (count-- > 0)
-		{
-			CHECK_FOR_INTERRUPTS();
-			rc = WaitLatch(&MyProc->procLatch,
-						   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
-						   100L);
-			if (rc & WL_POSTMASTER_DEATH)
-				break;
-			ResetLatch(&MyProc->procLatch);
-			LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_SHARED);
-			if (extension_ddl_message->result != ERR_PENDING)
-			{
-				LWLockRelease(diskquota_locks.extension_ddl_message_lock);
-				break;
-			}
-			LWLockRelease(diskquota_locks.extension_ddl_message_lock);
-		}
-	}
-	LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_SHARED);
-	if (extension_ddl_message->result != ERR_OK)
-	{
-		LWLockRelease(diskquota_locks.extension_ddl_message_lock);
-		LWLockRelease(diskquota_locks.extension_lock);
-		elog(ERROR, "[diskquota] failed to create diskquota extension: %s", ddl_err_code_to_err_message((MessageResult) extension_ddl_message->result));
-	}
-	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
-	LWLockRelease(diskquota_locks.extension_lock);
-	PG_RETURN_VOID();
-}
-
 /*
  * Process 'create extension' and 'drop extension' message.
  * For 'create extension' message, store dbid into table
@@ -960,101 +895,4 @@ process_extension_ddl_message()
 	extension_ddl_message->launcher_pid = MyProcPid;
 	extension_ddl_message->result = (int) code;
 	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
-}
-
-/*
- * This hook is used to handle drop extension diskquota event
- * It will send CMD_DROP_EXTENSION message to diskquota laucher.
- * Laucher will terminate the corresponding worker process and
- * remove the dbOid from the database_list table.
- */
-static void
-dq_object_access_hook(ObjectAccessType access, Oid classId,
-					  Oid objectId, int subId, void *arg)
-{
-	Oid			oid;
-	int			rc;
-
-	if (access != OAT_DROP || classId != ExtensionRelationId)
-		goto out;
-	oid = get_extension_oid("diskquota", true);
-	if (oid != objectId)
-		goto out;
-
-	/*
-	 * Lock on extension_lock to avoid multiple backend create diskquota
-	 * extension at the same time.
-	 */
-	LWLockAcquire(diskquota_locks.extension_lock, LW_EXCLUSIVE);
-	LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_EXCLUSIVE);
-	extension_ddl_message->req_pid = MyProcPid;
-	extension_ddl_message->cmd = CMD_DROP_EXTENSION;
-	extension_ddl_message->result = ERR_PENDING;
-	extension_ddl_message->dbid = MyDatabaseId;
-	rc = kill(extension_ddl_message->launcher_pid, SIGUSR1);
-	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
-	if (rc == 0)
-	{
-		int			count = WAIT_TIME_COUNT;
-
-		while (count-- > 0)
-		{
-			CHECK_FOR_INTERRUPTS();
-			rc = WaitLatch(&MyProc->procLatch,
-						   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
-						   100L);
-			if (rc & WL_POSTMASTER_DEATH)
-				break;
-			ResetLatch(&MyProc->procLatch);
-			LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_SHARED);
-			if (extension_ddl_message->result != ERR_PENDING)
-			{
-				LWLockRelease(diskquota_locks.extension_ddl_message_lock);
-				break;
-			}
-			LWLockRelease(diskquota_locks.extension_ddl_message_lock);
-		}
-	}
-	LWLockAcquire(diskquota_locks.extension_ddl_message_lock, LW_SHARED);
-	if (extension_ddl_message->result != ERR_OK)
-	{
-		LWLockRelease(diskquota_locks.extension_ddl_message_lock);
-		LWLockRelease(diskquota_locks.extension_lock);
-		elog(ERROR, "[diskquota launcher] failed to drop diskquota extension: %s", ddl_err_code_to_err_message((MessageResult) extension_ddl_message->result));
-	}
-	LWLockRelease(diskquota_locks.extension_ddl_message_lock);
-	LWLockRelease(diskquota_locks.extension_lock);
-out:
-	if (next_object_access_hook)
-		(*next_object_access_hook) (access, classId, objectId,
-									subId, arg);
-}
-
-/*
- * For extension DDL('create extension/drop extension')
- * Using this function to convert error code from diskquota
- * launcher to error message and return it to client.
- */
-static const char *
-ddl_err_code_to_err_message(MessageResult code)
-{
-	switch (code)
-	{
-		case ERR_PENDING:
-			return "no response from diskquota launcher, check whether launcher process exists";
-		case ERR_OK:
-			return "succeeded";
-		case ERR_EXCEED:
-			return "too many databases to monitor";
-		case ERR_ADD_TO_DB:
-			return "add dbid to database_list failed";
-		case ERR_DEL_FROM_DB:
-			return "delete dbid from database_list failed";
-		case ERR_START_WORKER:
-			return "start diskquota worker failed";
-		case ERR_INVALID_DBID:
-			return "invalid dbid";
-		default:
-			return "unknown error";
-	}
 }

@@ -1,6 +1,7 @@
 #ifndef DISK_QUOTA_H
 #define DISK_QUOTA_H
 
+#include "catalog/objectaccess.h"
 #include "storage/lwlock.h"
 
 typedef enum
@@ -82,6 +83,10 @@ typedef enum MessageResult MessageResult;
 
 extern DiskQuotaLocks diskquota_locks;
 extern ExtensionDDLMessage *extension_ddl_message;
+
+/* drop extension hook */
+extern void dq_object_access_hook(ObjectAccessType access, Oid classId,
+					  	  Oid objectId, int subId, void *arg);
 
 /* enforcement interface*/
 extern void init_disk_quota_enforcement(void);
