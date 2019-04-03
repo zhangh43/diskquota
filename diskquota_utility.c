@@ -19,6 +19,7 @@
 
 #include "access/xact.h"
 #include "catalog/namespace.h"
+#include "catalog/objectaccess.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_extension.h"
@@ -181,7 +182,7 @@ diskquota_start_worker(PG_FUNCTION_ARGS)
 /*
  * Add dq_object_access_hook to handle drop extension event.
  */
-void add_diskquota_object_access_hook()
+void add_diskquota_object_access_hook(void)
 {
 	next_object_access_hook = object_access_hook;
 	object_access_hook = dq_object_access_hook;

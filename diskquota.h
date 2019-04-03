@@ -84,7 +84,7 @@ extern DiskQuotaLocks diskquota_locks;
 extern ExtensionDDLMessage *extension_ddl_message;
 
 /* drop extension hook */
-extern void add_diskquota_object_access_hook();
+extern void add_diskquota_object_access_hook(void);
 
 /* enforcement interface*/
 extern void init_disk_quota_enforcement(void);
