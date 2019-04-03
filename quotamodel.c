@@ -122,6 +122,8 @@ static HTAB *local_disk_quota_black_map = NULL;
 
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 
+/* diskquota worker main fucntion */
+void	 disk_quota_worker_main(Datum);
 /* functions to refresh disk quota model*/
 static void refresh_disk_quota_usage(bool is_init);
 static void calculate_table_disk_usage(bool is_init);
@@ -142,6 +144,116 @@ static Size DiskQuotaShmemSize(void);
 static void disk_quota_shmem_startup(void);
 
 static void truncateStringInfo(StringInfo str, int nchars);
+
+
+
+/* ---- Functions for disk quota worker process ---- */
+
+/*
+ * Disk quota worker process will refresh disk quota model periodically.
+ * Refresh logic is defined in quotamodel.c
+ */
+void
+disk_quota_worker_main(Datum main_arg)
+{
+	char	   *dbname = MyBgworkerEntry->bgw_name;
+
+	ereport(LOG,
+			(errmsg("start disk quota worker process to monitor database:%s",
+					dbname)));
+
+	/* Establish signal handlers before unblocking signals. */
+	pqsignal(SIGHUP, disk_quota_sighup);
+	pqsignal(SIGTERM, disk_quota_sigterm);
+	pqsignal(SIGUSR1, disk_quota_sigusr1);
+
+	/* We're now ready to receive signals */
+	BackgroundWorkerUnblockSignals();
+
+	/* Connect to our database */
+	BackgroundWorkerInitializeConnection(dbname, NULL);
+
+	/*
+	 * Set ps display name of the worker process of diskquota, so we can
+	 * distinguish them quickly. Note: never mind parameter name of the
+	 * function `init_ps_display`, we only want the ps name looks like
+	 * 'bgworker: [diskquota] <dbname> ...'
+	 */
+	init_ps_display("bgworker:", "[diskquota]", dbname, "");
+
+	/*
+	 * Initialize diskquota related local hash map and refresh model
+	 * immediately
+	 */
+	init_disk_quota_model();
+	while (!got_sigterm)
+	{
+		int			rc;
+
+		CHECK_FOR_INTERRUPTS();
+
+		/*
+		 * Check whether the state is in ready mode. The state would be
+		 * unknown, when you `create extension diskquota` at the first time.
+		 * After running UDF init_table_size_table() The state will changed to
+		 * be ready.
+		 */
+		if (check_diskquota_state_is_ready())
+		{
+			break;
+		}
+		rc = WaitLatch(&MyProc->procLatch,
+					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
+					   diskquota_naptime * 1000L);
+		ResetLatch(&MyProc->procLatch);
+	}
+	refresh_disk_quota_model(true);
+
+	/*
+	 * Main loop: do this until the SIGTERM handler tells us to terminate
+	 */
+	while (!got_sigterm)
+	{
+		int			rc;
+
+		CHECK_FOR_INTERRUPTS();
+
+		/*
+		 * Background workers mustn't call usleep() or any direct equivalent:
+		 * instead, they may wait on their process latch, which sleeps as
+		 * necessary, but is awakened if postmaster dies.  That way the
+		 * background process goes away immediately in an emergency.
+		 */
+		rc = WaitLatch(&MyProc->procLatch,
+					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
+					   diskquota_naptime * 1000L);
+		ResetLatch(&MyProc->procLatch);
+
+		/* Do the work */
+		refresh_disk_quota_model(false);
+
+		if (diskquota_enable_hardlimit)
+		{
+			/* TODO: Add hard limit function here */
+		}
+
+		/* emergency bailout if postmaster has died */
+		if (rc & WL_POSTMASTER_DEATH)
+			proc_exit(1);
+
+		/*
+		 * In case of a SIGHUP, just reload the configuration.
+		 */
+		if (got_sighup)
+		{
+			got_sighup = false;
+			ProcessConfigFile(PGC_SIGHUP);
+		}
+	}
+
+	diskquota_invalidate_db(MyDatabaseId);
+	proc_exit(0);
+}
 
 /*
  * DiskQuotaShmemSize
