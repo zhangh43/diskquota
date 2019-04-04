@@ -67,7 +67,7 @@ struct TableSizeEntry
 	Oid			reloid;
 	Oid			namespaceoid;
 	Oid			owneroid;
-	int64		totalsize;
+	int64		totalsize;	/* table size including fsm, visibility map etc. */
 	bool		is_exist;		/* flag used to check whether table is already
 								 * dropped */
 	bool		need_flush;		/* whether need to flush to table table_size */
@@ -143,35 +143,34 @@ static void disk_quota_shmem_startup(void);
 
 static void truncateStringInfo(StringInfo str, int nchars);
 
-/*
- * DiskQuotaShmemSize
- * Compute space needed for diskquota-related shared memory
- */
-Size
-DiskQuotaShmemSize(void)
-{
-	Size		size;
-
-	size = sizeof(ExtensionDDLMessage);
-	size = add_size(size, hash_estimate_size(MAX_DISK_QUOTA_BLACK_ENTRIES, sizeof(BlackMapEntry)));
-	size = add_size(size, hash_estimate_size(diskquota_max_active_tables, sizeof(DiskQuotaActiveTableEntry)));
-	return size;
-}
-
-static void
-init_lwlocks(void)
-{
-	diskquota_locks.active_table_lock = LWLockAssign();
-	diskquota_locks.black_map_lock = LWLockAssign();
-	diskquota_locks.extension_ddl_message_lock = LWLockAssign();
-	diskquota_locks.extension_lock = LWLockAssign();
-}
-
+/* ---- Functions for disk quota shared memory ---- */
 /*
  * DiskQuotaShmemInit
  *		Allocate and initialize diskquota-related shared memory
+ *		This function is called in _PG_init().
  */
 void
+init_disk_quota_shmem(void)
+{
+	/*
+	 * Request additional shared resources.  (These are no-ops if we're not in
+	 * the postmaster process.)  We'll allocate or attach to the shared
+	 * resources in pgss_shmem_startup().
+	 */
+	RequestAddinShmemSpace(DiskQuotaShmemSize());
+	/* 4 locks for diskquota refer to init_lwlocks() for details*/
+	RequestAddinLWLocks(4);
+
+	/* Install startup hook to initialize our shared memory. */
+	prev_shmem_startup_hook = shmem_startup_hook;
+	shmem_startup_hook = disk_quota_shmem_startup;
+}
+
+/*
+ * DiskQuotaShmemInit hooks.
+ * Initialize shared memory data and locks.
+ */
+static void
 disk_quota_shmem_startup(void)
 {
 	bool		found;
@@ -180,11 +179,17 @@ disk_quota_shmem_startup(void)
 	if (prev_shmem_startup_hook)
 		(*prev_shmem_startup_hook) ();
 
-	disk_quota_black_map = NULL;
-
 	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
 
 	init_lwlocks();
+	/*
+	 * Three shared memory data.
+	 * extension_ddl_message is used to handle diskquota
+	 * extension create/drop command.
+	 * disk_quota_black_map is used to store out-of-quota blacklist.
+	 * active_tables_map is used to store active tables whose disk
+	 * usage is changed.
+	 */
 	extension_ddl_message = ShmemInitStruct("disk_quota_extension_ddl_message",
 											sizeof(ExtensionDDLMessage),
 											&found);
@@ -207,24 +212,41 @@ disk_quota_shmem_startup(void)
 	LWLockRelease(AddinShmemInitLock);
 }
 
-void
-init_disk_quota_shmem(void)
+/*
+ * Initialize four shared memory locks.
+ * active_table_lock is used to access active table map.
+ * black_map_lock is used to access out-of-quota blacklist.
+ * extension_ddl_message_lock is used to access content of
+ * extension_ddl_message.
+ * extension_ddl_lock is used to avoid concurrent diskquota
+ * extension ddl(create/drop) command.
+ */
+static void
+init_lwlocks(void)
 {
-	/*
-	 * Request additional shared resources.  (These are no-ops if we're not in
-	 * the postmaster process.)  We'll allocate or attach to the shared
-	 * resources in pgss_shmem_startup().
-	 */
-	RequestAddinShmemSpace(DiskQuotaShmemSize());
-	RequestAddinLWLocks(4);
-
-	/*
-	 * Install startup hook to initialize our shared memory.
-	 */
-	prev_shmem_startup_hook = shmem_startup_hook;
-	shmem_startup_hook = disk_quota_shmem_startup;
+	diskquota_locks.active_table_lock = LWLockAssign();
+	diskquota_locks.black_map_lock = LWLockAssign();
+	diskquota_locks.extension_ddl_message_lock = LWLockAssign();
+	diskquota_locks.extension_ddl_lock = LWLockAssign();
 }
 
+/*
+ * DiskQuotaShmemSize
+ * Compute space needed for diskquota-related shared memory
+ */
+static Size
+DiskQuotaShmemSize(void)
+{
+	Size		size;
+
+	size = sizeof(ExtensionDDLMessage);
+	size = add_size(size, hash_estimate_size(MAX_DISK_QUOTA_BLACK_ENTRIES, sizeof(BlackMapEntry)));
+	size = add_size(size, hash_estimate_size(diskquota_max_active_tables, sizeof(DiskQuotaActiveTableEntry)));
+	return size;
+}
+
+
+/* ---- Functions for disk quota model ---- */
 /*
  * Init disk quota model when the worker process firstly started.
  */
@@ -233,7 +255,7 @@ init_disk_quota_model(void)
 {
 	HASHCTL		hash_ctl;
 
-	/* init hash table for table/schema/role etc. */
+	/* initialize hash table for table/schema/role etc. */
 	memset(&hash_ctl, 0, sizeof(hash_ctl));
 	hash_ctl.keysize = sizeof(Oid);
 	hash_ctl.entrysize = sizeof(TableSizeEntry);
@@ -297,6 +319,12 @@ init_disk_quota_model(void)
 
 /*
  * Check whether the diskquota state is ready
+ * For empty database, the diskquota state would
+ * be ready after 'create extension diskquota' and
+ * it's ready to use. But for non-empty database,
+ * user need to run UDF diskquota.init_table_size_table()
+ * manually to get all the table size information and
+ * store them into table diskquota.table_size
  */
 static bool
 do_check_diskquota_state_is_ready(void)
@@ -308,14 +336,6 @@ do_check_diskquota_state_is_ready(void)
 	RangeVar   *rv;
 	Relation	rel;
 
-	/* check table diskquota.state exists */
-	rv = makeRangeVar("diskquota", "state", -1);
-	rel = heap_openrv_extended(rv, AccessShareLock, true);
-	if (!rel)
-	{
-		return false;
-	}
-	heap_close(rel, AccessShareLock);
 
 	/* check diskquota state from table diskquota.state */
 	ret = SPI_execute("select state from diskquota.state", true, 0);
