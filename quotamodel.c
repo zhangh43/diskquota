@@ -319,63 +319,6 @@ init_disk_quota_model(void)
 
 /*
  * Check whether the diskquota state is ready
- * For empty database, the diskquota state would
- * be ready after 'create extension diskquota' and
- * it's ready to use. But for non-empty database,
- * user need to run UDF diskquota.init_table_size_table()
- * manually to get all the table size information and
- * store them into table diskquota.table_size
- */
-static bool
-do_check_diskquota_state_is_ready(void)
-{
-	int			ret;
-	TupleDesc	tupdesc;
-	int			i;
-
-	RangeVar   *rv;
-	Relation	rel;
-
-
-	/* check diskquota state from table diskquota.state */
-	ret = SPI_execute("select state from diskquota.state", true, 0);
-	if (ret != SPI_OK_SELECT)
-		elog(ERROR, "[diskquota] check diskquota state SPI_execute failed: error code %d", ret);
-
-	tupdesc = SPI_tuptable->tupdesc;
-	if (tupdesc->natts != 1 ||
-		((tupdesc)->attrs[0])->atttypid != INT4OID)
-	{
-		elog(ERROR, "[diskquota] table \"state\" is corrupted in database \"%s\","
-			 " please recreate diskquota extension",
-			 get_database_name(MyDatabaseId));
-		return false;
-	}
-
-	for (i = 0; i < SPI_processed; i++)
-	{
-		HeapTuple	tup = SPI_tuptable->vals[i];
-		Datum		dat;
-		int			state;
-		bool		isnull;
-
-		dat = SPI_getbinval(tup, tupdesc, 1, &isnull);
-		if (isnull)
-			continue;
-		state = DatumGetInt64(dat);
-
-		if (state == DISKQUOTA_READY_STATE)
-		{
-			return true;
-		}
-	}
-	ereport(LOG, (errmsg("Diskquota is not in ready state. "
-						 "please run UDF init_table_size_table()")));
-	return false;
-}
-
-/*
- * Check whether the diskquota state is ready
 */
 bool
 check_diskquota_state_is_ready(void)
@@ -429,9 +372,65 @@ check_diskquota_state_is_ready(void)
 }
 
 /*
- * diskquota worker will refresh disk quota model
+ * Check whether the diskquota state is ready
+ * For empty database, the diskquota state would
+ * be ready after 'create extension diskquota' and
+ * it's ready to use. But for non-empty database,
+ * user need to run UDF diskquota.init_table_size_table()
+ * manually to get all the table size information and
+ * store them into table diskquota.table_size
+ */
+static bool
+do_check_diskquota_state_is_ready(void)
+{
+	int			ret;
+	TupleDesc	tupdesc;
+	int			i;
+
+	/*
+	 * check diskquota state from table diskquota.state
+	 * errors will be catch at upper level function.
+	 */
+	ret = SPI_execute("select state from diskquota.state", true, 0);
+	if (ret != SPI_OK_SELECT)
+		elog(ERROR, "[diskquota] check diskquota state SPI_execute failed: error code %d", ret);
+
+	tupdesc = SPI_tuptable->tupdesc;
+	if (tupdesc->natts != 1 ||
+		((tupdesc)->attrs[0])->atttypid != INT4OID)
+	{
+		elog(ERROR, "[diskquota] table \"state\" is corrupted in database \"%s\","
+			 " please recreate diskquota extension",
+			 get_database_name(MyDatabaseId));
+	}
+
+	for (i = 0; i < SPI_processed; i++)
+	{
+		HeapTuple	tup = SPI_tuptable->vals[i];
+		Datum		dat;
+		int			state;
+		bool		isnull;
+
+		dat = SPI_getbinval(tup, tupdesc, 1, &isnull);
+		if (isnull)
+			continue;
+		state = DatumGetInt64(dat);
+
+		if (state == DISKQUOTA_READY_STATE)
+		{
+			return true;
+		}
+	}
+	ereport(WARNING, (errmsg("Diskquota is not in ready state. "
+						 "please run UDF init_table_size_table()")));
+	return false;
+}
+
+/*
+ * Diskquota worker will refresh disk quota model
  * periodically. It will reload quota setting and
  * recalculate the changed disk usage.
+ * If
  */
 void
 refresh_disk_quota_model(bool is_init)
@@ -447,6 +446,8 @@ refresh_disk_quota_model(bool is_init)
 /*
  * Update the disk usage of namespace and role.
  * Put the exceeded namespace and role into shared black map.
+ * Parameter 'force' is true when it's the first time that worker
+ * process is constructing quota model.
  */
 static void
 refresh_disk_quota_usage(bool force)
@@ -503,6 +504,270 @@ refresh_disk_quota_usage(bool force)
 		AbortCurrentTransaction();
 
 	return;
+}
+
+/*
+ *  Incremental way to update the disk quota of every database objects
+ *  Recalculate the table's disk usage when it's a new table or active table.
+ *  Detect the removed table if it's no longer in pg_class.
+ *  If change happens, no matter size change or owner change,
+ *  update namespace_size_map and role_size_map correspondingly.
+ *  Parameter 'force' set to true at initialization stage to fetch tables
+ *  size from table table_size
+ *
+ */
+static void
+calculate_table_disk_usage(bool is_init)
+{
+	bool		table_size_map_found;
+	bool		active_tbl_found;
+	int64	updated_total_size;
+	Relation	classRel;
+	HeapTuple	tuple;
+	HeapScanDesc relScan;
+	TableSizeEntry *tsentry = NULL;
+	Oid			relOid;
+	HASH_SEQ_STATUS iter;
+	HTAB	   *local_active_table_stat_map;
+	DiskQuotaActiveTableEntry *active_table_entry;
+
+	classRel = heap_open(RelationRelationId, AccessShareLock);
+	relScan = heap_beginscan_catalog(classRel, 0, NULL);
+
+	/*
+	 * initialization stage all the tables are active.
+	 * later loop, only the tables whose disk size changed
+	 * will be treated as active
+	 */
+	local_active_table_stat_map = gp_fetch_active_tables(is_init);
+
+	/*
+	 * unset is_exist flag for tsentry in table_size_map
+	 * this is used to detect tables which have been dropped.
+	 */
+	hash_seq_init(&iter, table_size_map);
+	while ((tsentry = hash_seq_search(&iter)) != NULL)
+	{
+		tsentry->is_exist = false;
+	}
+
+	/*
+	 * scan pg_class to detect table event: drop, reset schema, reset owenr.
+	 * calculate the file size for active table and update namespace_size_map
+	 * and role_size_map
+	 */
+	while ((tuple = heap_getnext(relScan, ForwardScanDirection)) != NULL)
+	{
+		Form_pg_class classForm = (Form_pg_class) GETSTRUCT(tuple);
+
+		if (classForm->relkind != RELKIND_RELATION &&
+			classForm->relkind != RELKIND_MATVIEW)
+			continue;
+		relOid = HeapTupleGetOid(tuple);
+
+		/* ignore system table */
+		if (relOid < FirstNormalObjectId)
+			continue;
+
+		tsentry = (TableSizeEntry *) hash_search(table_size_map,
+												 &relOid,
+												 HASH_ENTER, &table_size_map_found);
+
+		if (!table_size_map_found)
+		{
+			tsentry->reloid = relOid;
+			tsentry->totalsize = 0;
+			tsentry->owneroid = 0;
+			tsentry->namespaceoid = 0;
+			tsentry->need_flush = true;
+		}
+
+		/* mark tsentry is_exist */
+		if (tsentry)
+			tsentry->is_exist = true;
+
+		active_table_entry = (DiskQuotaActiveTableEntry *) hash_search(local_active_table_stat_map, &relOid, HASH_FIND, &active_tbl_found);
+
+		/* skip to recalculate the tables which are not in active list */
+		if (active_tbl_found)
+		{
+			/* firstly calculate the updated total size of a table */
+			;
+			if (table_size_map_found)
+				updated_total_size = active_table_entry->tablesize - tsentry->totalsize;
+			else
+				updated_total_size = active_table_entry->tablesize;
+
+			/* update the table_size entry */
+			tsentry->totalsize = (int64) active_table_entry->tablesize;
+			tsentry->need_flush = true;
+
+			/* update the disk usage of namespace and owner */
+			update_namespace_map(tsentry->namespaceoid, updated_total_size);
+			update_role_map(tsentry->owneroid, updated_total_size);
+		}
+
+		/* table size info doesn't need to flush at init quota model stage */
+		if (is_init)
+		{
+			tsentry->need_flush = false;
+		}
+
+		/* if schema change, transfer the file size */
+		if (tsentry->namespaceoid != classForm->relnamespace)
+		{
+			update_namespace_map(tsentry->namespaceoid, -1 * tsentry->totalsize);
+			tsentry->namespaceoid = classForm->relnamespace;
+			update_namespace_map(tsentry->namespaceoid, tsentry->totalsize);
+		}
+		/* if owner change, transfer the file size */
+		if (tsentry->owneroid != classForm->relowner)
+		{
+			update_role_map(tsentry->owneroid, -1 * tsentry->totalsize);
+			tsentry->owneroid = classForm->relowner;
+			update_role_map(tsentry->owneroid, tsentry->totalsize);
+		}
+	}
+
+	heap_endscan(relScan);
+	heap_close(classRel, AccessShareLock);
+	hash_destroy(local_active_table_stat_map);
+
+	/*
+	 * Process removed tables. Reduce schema and role size firstly. Remove
+	 * table from table_size_map in flush_to_table_size() function later.
+	 */
+	hash_seq_init(&iter, table_size_map);
+	while ((tsentry = hash_seq_search(&iter)) != NULL)
+	{
+		if (tsentry->is_exist == false)
+		{
+			update_role_map(tsentry->owneroid, -1 * tsentry->totalsize);
+			update_namespace_map(tsentry->namespaceoid, -1 * tsentry->totalsize);
+		}
+	}
+}
+
+/*
+ * Check the namespace quota limit and current usage
+ * Remove dropped namespace from namespace_size_map
+ */
+static void
+calculate_schema_disk_usage(void)
+{
+	HeapTuple	tuple;
+	HASH_SEQ_STATUS iter;
+	NamespaceSizeEntry *nsentry;
+
+	hash_seq_init(&iter, namespace_size_map);
+
+	while ((nsentry = hash_seq_search(&iter)) != NULL)
+	{
+		/* check if namespace is already be deleted */
+		tuple = SearchSysCache1(NAMESPACEOID, ObjectIdGetDatum(nsentry->namespaceoid));
+		if (!HeapTupleIsValid(tuple))
+		{
+			remove_namespace_map(nsentry->namespaceoid);
+			continue;
+		}
+		ReleaseSysCache(tuple);
+		check_disk_quota_by_oid(nsentry->namespaceoid, nsentry->totalsize, NAMESPACE_QUOTA);
+	}
+}
+
+/*
+ * Check the role quota limit and current usage
+ * Remove dropped role from roel_size_map
+ */
+static void
+calculate_role_disk_usage(void)
+{
+	HeapTuple	tuple;
+	HASH_SEQ_STATUS iter;
+	RoleSizeEntry *rolentry;
+
+	hash_seq_init(&iter, role_size_map);
+
+	while ((rolentry = hash_seq_search(&iter)) != NULL)
+	{
+		/* check if role is already be deleted */
+		tuple = SearchSysCache1(AUTHOID, ObjectIdGetDatum(rolentry->owneroid));
+		if (!HeapTupleIsValid(tuple))
+		{
+			remove_role_map(rolentry->owneroid);
+			continue;
+		}
+		ReleaseSysCache(tuple);
+		check_disk_quota_by_oid(rolentry->owneroid, rolentry->totalsize, ROLE_QUOTA);
+	}
+}
+
+/*
+ * Flush the table_size_map to user table diskquota.table_size
+ * To improve update performance, we first delete all the need_to_flush
+ * entries in table table_size. And then insert new table size entries into
+ * table table_size.
+ */
+static void
+flush_to_table_size(void)
+{
+	HASH_SEQ_STATUS iter;
+	TableSizeEntry *tsentry = NULL;
+	StringInfoData delete_statement;
+	StringInfoData insert_statement;
+	bool		delete_statement_flag = false;
+	bool		insert_statement_flag = false;
+	int			ret;
+
+	/* TODO: Add flush_size_interval to avoid flushing size info in every loop */
+
+	/* concatenate all the need_to_flush table to SQL string */
+	initStringInfo(&delete_statement);
+	appendStringInfo(&delete_statement, "delete from diskquota.table_size where tableid in (");
+	initStringInfo(&insert_statement);
+	appendStringInfo(&insert_statement, "insert into diskquota.table_size values ");
+	hash_seq_init(&iter, table_size_map);
+	while ((tsentry = hash_seq_search(&iter)) != NULL)
+	{
+		/* delete dropped table from both table_size_map and table table_size */
+		if (tsentry->is_exist == false)
+		{
+			appendStringInfo(&delete_statement, "%u, ", tsentry->reloid);
+			delete_statement_flag = true;
+
+			hash_search(table_size_map,
+						&tsentry->reloid,
+						HASH_REMOVE, NULL);
+		}
+		/* update the table size by delete+insert in table table_size */
+		else if (tsentry->need_flush == true)
+		{
+			tsentry->need_flush = false;
+			appendStringInfo(&delete_statement, "%u, ", tsentry->reloid);
+			appendStringInfo(&insert_statement, "(%u,%ld), ", tsentry->reloid, tsentry->totalsize);
+			delete_statement_flag = true;
+			insert_statement_flag = true;
+		}
+	}
+	truncateStringInfo(&delete_statement, delete_statement.len - strlen(", "));
+	truncateStringInfo(&insert_statement, insert_statement.len - strlen(", "));
+	appendStringInfo(&delete_statement, ");");
+	appendStringInfo(&insert_statement, ";");
+
+	if (delete_statement_flag)
+	{
+		elog(DEBUG1, "[diskquota] table_size delete_statement: %s", delete_statement.data);
+		ret = SPI_execute(delete_statement.data, false, 0);
+		if (ret != SPI_OK_DELETE)
+			elog(ERROR, "[diskquota] flush_to_table_size SPI_execute failed: error code %d", ret);
+	}
+	if (insert_statement_flag)
+	{
+		elog(DEBUG1, "[diskquota] table_size insert_statement: %s", insert_statement.data);
+		ret = SPI_execute(insert_statement.data, false, 0);
+		if (ret != SPI_OK_INSERT)
+			elog(ERROR, "[diskquota] flush_to_table_size SPI_execute failed: error code %d", ret);
+	}
 }
 
 /*
@@ -687,207 +952,6 @@ update_role_map(Oid owneroid, int64 updatesize)
 
 }
 
-/*
- *  Incremental way to update the disk quota of every database objects
- *  Recalculate the table's disk usage when it's a new table or active table.
- *  Detect the removed table if it's no longer in pg_class.
- *  If change happens, no matter size change or owner change,
- *  update namespace_size_map and role_size_map correspondingly.
- *  Parameter 'force' set to true at initialization stage to recalculate
- *  the file size of all the tables.
- *
- */
-static void
-calculate_table_disk_usage(bool is_init)
-{
-	bool		found;
-	bool		active_tbl_found = false;
-	Relation	classRel;
-	HeapTuple	tuple;
-	HeapScanDesc relScan;
-	TableSizeEntry *tsentry = NULL;
-	Oid			relOid;
-	HASH_SEQ_STATUS iter;
-	HTAB	   *local_active_table_stat_map;
-	DiskQuotaActiveTableEntry *active_table_entry;
-
-	classRel = heap_open(RelationRelationId, AccessShareLock);
-	relScan = heap_beginscan_catalog(classRel, 0, NULL);
-
-	local_active_table_stat_map = gp_fetch_active_tables(is_init);
-
-	/* unset is_exist flag for tsentry in table_size_map */
-	hash_seq_init(&iter, table_size_map);
-	while ((tsentry = hash_seq_search(&iter)) != NULL)
-	{
-		tsentry->is_exist = false;
-	}
-
-	/*
-	 * scan pg_class to detect table event: drop, reset schema, reset owenr.
-	 * calculate the file size for active table and update namespace_size_map
-	 * and role_size_map
-	 */
-	while ((tuple = heap_getnext(relScan, ForwardScanDirection)) != NULL)
-	{
-		Form_pg_class classForm = (Form_pg_class) GETSTRUCT(tuple);
-
-		found = false;
-		if (classForm->relkind != RELKIND_RELATION &&
-			classForm->relkind != RELKIND_MATVIEW)
-			continue;
-		relOid = HeapTupleGetOid(tuple);
-
-		/* ignore system table */
-		if (relOid < FirstNormalObjectId)
-			continue;
-
-		tsentry = (TableSizeEntry *) hash_search(table_size_map,
-												 &relOid,
-												 HASH_ENTER, &found);
-
-		if (!found)
-		{
-			tsentry->totalsize = 0;
-			tsentry->owneroid = 0;
-			tsentry->namespaceoid = 0;
-			tsentry->need_flush = true;
-		}
-
-		/* mark tsentry is_exist */
-		if (tsentry)
-			tsentry->is_exist = true;
-
-		active_table_entry = (DiskQuotaActiveTableEntry *) hash_search(local_active_table_stat_map, &relOid, HASH_FIND, &active_tbl_found);
-
-		/*
-		 * skip to recalculate the tables which are not in active list and not
-		 * at initializatio stage
-		 */
-		if (active_tbl_found)
-		{
-
-			/* namespace and owner may be changed since last check */
-			if (!found)
-			{
-				/* if it's a new table */
-				tsentry->reloid = relOid;
-				tsentry->namespaceoid = classForm->relnamespace;
-				tsentry->owneroid = classForm->relowner;
-				tsentry->totalsize = (int64) active_table_entry->tablesize;
-				tsentry->need_flush = true;
-				update_namespace_map(tsentry->namespaceoid, tsentry->totalsize);
-				update_role_map(tsentry->owneroid, tsentry->totalsize);
-			}
-			else
-			{
-				/*
-				 * if not new table in table_size_map, it must be in active
-				 * table list
-				 */
-				int64		oldtotalsize = tsentry->totalsize;
-
-				tsentry->totalsize = (int64) active_table_entry->tablesize;
-				tsentry->need_flush = true;
-				update_namespace_map(tsentry->namespaceoid, tsentry->totalsize - oldtotalsize);
-				update_role_map(tsentry->owneroid, tsentry->totalsize - oldtotalsize);
-			}
-		}
-
-		/* table size info doesn't need to flush at init quota model stage */
-		if (is_init)
-		{
-			tsentry->need_flush = false;
-		}
-
-		/* if schema change, transfer the file size */
-		if (tsentry->namespaceoid != classForm->relnamespace)
-		{
-			update_namespace_map(tsentry->namespaceoid, -1 * tsentry->totalsize);
-			tsentry->namespaceoid = classForm->relnamespace;
-			update_namespace_map(tsentry->namespaceoid, tsentry->totalsize);
-		}
-		/* if owner change, transfer the file size */
-		if (tsentry->owneroid != classForm->relowner)
-		{
-			update_role_map(tsentry->owneroid, -1 * tsentry->totalsize);
-			tsentry->owneroid = classForm->relowner;
-			update_role_map(tsentry->owneroid, tsentry->totalsize);
-		}
-	}
-
-	heap_endscan(relScan);
-	heap_close(classRel, AccessShareLock);
-	hash_destroy(local_active_table_stat_map);
-
-	/*
-	 * Process removed tables. Reduce schema and role size firstly. Remove
-	 * table from table_size_map in flush_to_table_size() function later.
-	 */
-	hash_seq_init(&iter, table_size_map);
-	while ((tsentry = hash_seq_search(&iter)) != NULL)
-	{
-		if (tsentry->is_exist == false)
-		{
-			update_role_map(tsentry->owneroid, -1 * tsentry->totalsize);
-			update_namespace_map(tsentry->namespaceoid, -1 * tsentry->totalsize);
-		}
-	}
-}
-
-/*
- * Check the namespace quota limit and current usage
- * Remove dropped namespace from namespace_size_map
- */
-static void
-calculate_schema_disk_usage(void)
-{
-	HeapTuple	tuple;
-	HASH_SEQ_STATUS iter;
-	NamespaceSizeEntry *nsentry;
-
-	hash_seq_init(&iter, namespace_size_map);
-
-	while ((nsentry = hash_seq_search(&iter)) != NULL)
-	{
-		/* check if namespace is already be deleted */
-		tuple = SearchSysCache1(NAMESPACEOID, ObjectIdGetDatum(nsentry->namespaceoid));
-		if (!HeapTupleIsValid(tuple))
-		{
-			remove_namespace_map(nsentry->namespaceoid);
-			continue;
-		}
-		ReleaseSysCache(tuple);
-		check_disk_quota_by_oid(nsentry->namespaceoid, nsentry->totalsize, NAMESPACE_QUOTA);
-	}
-}
-
-/*
- * Check the role quota limit and current usage
- * Remove dropped role from roel_size_map
- */
-static void
-calculate_role_disk_usage(void)
-{
-	HeapTuple	tuple;
-	HASH_SEQ_STATUS iter;
-	RoleSizeEntry *rolentry;
-
-	hash_seq_init(&iter, role_size_map);
-
-	while ((rolentry = hash_seq_search(&iter)) != NULL)
-	{
-		/* check if role is already be deleted */
-		tuple = SearchSysCache1(AUTHOID, ObjectIdGetDatum(rolentry->owneroid));
-		if (!HeapTupleIsValid(tuple))
-		{
-			remove_role_map(rolentry->owneroid);
-			continue;
-		}
-		ReleaseSysCache(tuple);
-		check_disk_quota_by_oid(rolentry->owneroid, rolentry->totalsize, ROLE_QUOTA);
-	}
-}
 
 /*
  * Make sure a StringInfo's string is no longer than 'nchars' characters.
@@ -905,74 +969,7 @@ truncateStringInfo(StringInfo str, int nchars)
 	}
 }
 
-/*
- * Flush the table_size_map to user table diskquota.table_size
- * To improve update performance, we first delete all the need_to_flush
- * entries in table table_size. And then insert new table size entries into
- * table table_size.
- */
-static
-void
-flush_to_table_size(void)
-{
-	HASH_SEQ_STATUS iter;
-	TableSizeEntry *tsentry = NULL;
-	StringInfoData delete_statement;
-	StringInfoData insert_statement;
-	bool		delete_statement_flag = false;
-	bool		insert_statement_flag = false;
-	int			ret;
 
-	/* TODO: Add flush_size_interval to avoid flushing size info in every loop */
-
-	/* concatenate all the need_to_flush table to SQL string */
-	initStringInfo(&delete_statement);
-	appendStringInfo(&delete_statement, "delete from diskquota.table_size where tableid in (");
-	initStringInfo(&insert_statement);
-	appendStringInfo(&insert_statement, "insert into diskquota.table_size values ");
-	hash_seq_init(&iter, table_size_map);
-	while ((tsentry = hash_seq_search(&iter)) != NULL)
-	{
-		/* delete dropped table from both table_size_map and table table_size */
-		if (tsentry->is_exist == false)
-		{
-			appendStringInfo(&delete_statement, "%u, ", tsentry->reloid);
-			delete_statement_flag = true;
-
-			hash_search(table_size_map,
-						&tsentry->reloid,
-						HASH_REMOVE, NULL);
-		}
-		/* update the table size by delete+insert in table table_size */
-		else if (tsentry->need_flush == true)
-		{
-			tsentry->need_flush = false;
-			appendStringInfo(&delete_statement, "%u, ", tsentry->reloid);
-			appendStringInfo(&insert_statement, "(%u,%ld), ", tsentry->reloid, tsentry->totalsize);
-			delete_statement_flag = true;
-			insert_statement_flag = true;
-		}
-	}
-	truncateStringInfo(&delete_statement, delete_statement.len - strlen(", "));
-	truncateStringInfo(&insert_statement, insert_statement.len - strlen(", "));
-	appendStringInfo(&delete_statement, ");");
-	appendStringInfo(&insert_statement, ";");
-
-	if (delete_statement_flag)
-	{
-		elog(DEBUG1, "[diskquota] table_size delete_statement: %s", delete_statement.data);
-		ret = SPI_execute(delete_statement.data, false, 0);
-		if (ret != SPI_OK_DELETE)
-			elog(ERROR, "[diskquota] flush_to_table_size SPI_execute failed: error code %d", ret);
-	}
-	if (insert_statement_flag)
-	{
-		elog(DEBUG1, "[diskquota] table_size insert_statement: %s", insert_statement.data);
-		ret = SPI_execute(insert_statement.data, false, 0);
-		if (ret != SPI_OK_INSERT)
-			elog(ERROR, "[diskquota] flush_to_table_size SPI_execute failed: error code %d", ret);
-	}
-}
 
 /*
  * Interface to load quotas from diskquota configuration table(quota_config).
