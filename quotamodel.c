@@ -592,11 +592,7 @@ calculate_table_disk_usage(bool is_init)
 		if (active_tbl_found)
 		{
 			/* firstly calculate the updated total size of a table */
-			;
-			if (table_size_map_found)
-				updated_total_size = active_table_entry->tablesize - tsentry->totalsize;
-			else
-				updated_total_size = active_table_entry->tablesize;
+			updated_total_size = active_table_entry->tablesize - tsentry->totalsize;
 
 			/* update the table_size entry */
 			tsentry->totalsize = (int64) active_table_entry->tablesize;
@@ -952,7 +948,6 @@ update_role_map(Oid owneroid, int64 updatesize)
 
 }
 
-
 /*
  * Make sure a StringInfo's string is no longer than 'nchars' characters.
  */
@@ -968,8 +963,6 @@ truncateStringInfo(StringInfo str, int nchars)
 		str->data[nchars] = '\0';
 	}
 }
-
-
 
 /*
  * Interface to load quotas from diskquota configuration table(quota_config).
@@ -1059,6 +1052,9 @@ do_load_quotas(void)
 						   HASH_REMOVE, NULL);
 	}
 
+	/*
+	 * read quotas from diskquota.quota_config
+	 */
 	ret = SPI_execute("select targetoid, quotatype, quotalimitMB from diskquota.quota_config", true, 0);
 	if (ret != SPI_OK_SELECT)
 		elog(ERROR, "[diskquota] load_quotas SPI_execute failed: error code %d", ret);
@@ -1139,7 +1135,7 @@ get_rel_owner_schema(Oid relid, Oid *ownerOid, Oid *nsOid)
 /*
  * Given table oid, check whether quota limit
  * of table's schema or table's owner are reached.
- * Do enforcemet if quota exceeds.
+ * Do enforcement if quota exceeds.
  */
 bool
 quota_check_common(Oid reloid)
@@ -1167,6 +1163,7 @@ quota_check_common(Oid reloid)
 					HASH_FIND, &found);
 		if (found)
 		{
+			LWLockRelease(diskquota_locks.black_map_lock);
 			ereport(ERROR,
 					(errcode(ERRCODE_DISK_FULL),
 					 errmsg("schema's disk space quota exceeded with name:%s", get_namespace_name(nsOid))));
@@ -1185,6 +1182,7 @@ quota_check_common(Oid reloid)
 					HASH_FIND, &found);
 		if (found)
 		{
+			LWLockRelease(diskquota_locks.black_map_lock);
 			ereport(ERROR,
 					(errcode(ERRCODE_DISK_FULL),
 					 errmsg("role's disk space quota exceeded with name:%s", GetUserNameFromId(ownerOid))));
