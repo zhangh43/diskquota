@@ -46,33 +46,35 @@ resources:
     branch: gpdb
     uri: https://github.com/greenplum-db/diskquota.git
 
+# gpdb binary on gcs is located as different folder for different version
+# use gcs_gpdb_binary_folder to specify them.
 - name: bin_gpdb_centos6
   type: gcs
   source:
     bucket: {{gcs-bucket-intermediates}}
     json_key: {{concourse-gcs-resources-service-account-key}}
-    versioned_file: 6X_STABLE/bin_gpdb_centos6/bin_gpdb.tar.gz
+    versioned_file: ((gcs_gpdb_binary_folder))/bin_gpdb_centos6/bin_gpdb.tar.gz
 
 - name: bin_gpdb_centos7
   type: gcs
   source:
     bucket: {{gcs-bucket-intermediates}}
     json_key: {{concourse-gcs-resources-service-account-key}}
-    versioned_file: 6X_STABLE/bin_gpdb_centos7/bin_gpdb.tar.gz
+    versioned_file: ((gcs_gpdb_binary_folder))/bin_gpdb_centos7/bin_gpdb.tar.gz
 
 - name: bin_diskquota_centos7
   type: gcs
   source:
     bucket: {{gcs-bucket-intermediates}}
     json_key: {{concourse-gcs-resources-service-account-key}}
-    versioned_file: diskquota/published/gpdb6/rhel7/component_diskquota.tar.gz
+    versioned_file: diskquota/published/((gcs_diskquota_binary_folder))/rhel7/component_diskquota.tar.gz
 
 - name: bin_diskquota_centos6
   type: gcs
   source:
     bucket: {{gcs-bucket-intermediates}}
     json_key: {{concourse-gcs-resources-service-account-key}}
-    versioned_file: diskquota/published/gpdb6/rhel6/component_diskquota.tar.gz
+    versioned_file: diskquota/published/((gcs_diskquota_binary_folder))/rhel6/component_diskquota.tar.gz
 
 ## jobs
 ## ======================================================================
