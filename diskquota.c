@@ -179,7 +179,8 @@ _PG_init(void)
 	worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
 		BGWORKER_BACKEND_DATABASE_CONNECTION;
 	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
-	worker.bgw_restart_time = BGW_NEVER_RESTART;
+	/* launcher process should be restarted after pm reset. */
+	worker.bgw_restart_time = BGW_DEFAULT_RESTART_INTERVAL;
 	snprintf(worker.bgw_library_name, BGW_MAXLEN, "diskquota");
 	snprintf(worker.bgw_function_name, BGW_MAXLEN, "disk_quota_launcher_main");
 	worker.bgw_notify_pid = 0;
@@ -306,6 +307,25 @@ disk_quota_worker_main(Datum main_arg)
 					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
 					   diskquota_naptime * 1000L);
 		ResetLatch(&MyProc->procLatch);
+
+		/* Emergency bailout if postmaster has died */
+		if (rc & WL_POSTMASTER_DEATH)
+			proc_exit(1);
+
+		/* In case of a SIGHUP, just reload the configuration. */
+		if (got_sighup)
+		{
+			got_sighup = false;
+			ProcessConfigFile(PGC_SIGHUP);
+		}
+	}
+
+	/* if received sigterm, just exit the worker process */
+	if (got_sigterm)
+	{
+		/* clear the out-of-quota blacklist in shared memory */
+		invalidate_database_blackmap(MyDatabaseId);
+		proc_exit(0);
 	}
 
 	/* Refresh quota model with init mode */
@@ -331,13 +351,6 @@ disk_quota_worker_main(Datum main_arg)
 					   diskquota_naptime * 1000L);
 		ResetLatch(&MyProc->procLatch);
 
-		/* Do the work */
-		refresh_disk_quota_model(false);
-
-		if (diskquota_enable_hardlimit)
-		{
-			/* TODO: Add hard limit function here */
-		}
 
 		/* Emergency bailout if postmaster has died */
 		if (rc & WL_POSTMASTER_DEATH)
@@ -348,6 +361,14 @@ disk_quota_worker_main(Datum main_arg)
 		{
 			got_sighup = false;
 			ProcessConfigFile(PGC_SIGHUP);
+		}
+
+		/* Do the work */
+		refresh_disk_quota_model(false);
+
+		if (diskquota_enable_hardlimit)
+		{
+			/* TODO: Add hard limit function here */
 		}
 	}
 
@@ -427,7 +448,7 @@ disk_quota_launcher_main(Datum main_arg)
 					   diskquota_naptime * 1000L);
 		ResetLatch(&MyProc->procLatch);
 
-		/* emergency bailout if postmaster has died */
+		/* Emergency bailout if postmaster has died */
 		if (rc & WL_POSTMASTER_DEATH)
 			proc_exit(1);
 
@@ -446,7 +467,7 @@ disk_quota_launcher_main(Datum main_arg)
 		}
 	}
 
-	proc_exit(1);
+	proc_exit(0);
 }
 
 
@@ -493,7 +514,7 @@ create_monitor_db_table(void)
 
 		if (SPI_execute(sql, false, 0) != SPI_OK_UTILITY)
 		{
-			elog(ERROR, "[diskquota launcher] SPI_execute error, sql:'%s', code %d", sql, ret);
+			elog(ERROR, "[diskquota launcher] SPI_execute error, sql:'%s', errno:%d", sql, errno);
 		}
 	}
 	PG_CATCH();
@@ -540,7 +561,7 @@ start_workers_from_dblist(void)
 	PushActiveSnapshot(GetTransactionSnapshot());
 	ret = SPI_connect();
 	if (ret != SPI_OK_CONNECT)
-		elog(ERROR, "[diskquota launcher] SPI connect error, code=%d", ret);
+		elog(ERROR, "[diskquota launcher] SPI connect error, errno:%d", errno);
 	ret = SPI_execute("select dbid from diskquota_namespace.database_list;", true, 0);
 	if (ret != SPI_OK_SELECT)
 		elog(ERROR, "select diskquota_namespace.database_list");
@@ -561,9 +582,12 @@ start_workers_from_dblist(void)
 			elog(ERROR, "[diskquota launcher] dbid cann't be null in table database_list");
 		dbid = DatumGetObjectId(dat);
 		if (!is_valid_dbid(dbid))
+		{
+			elog(LOG, "[diskquota launcher] database(oid:%u) in table database_list is not a valid database", dbid);
 			continue;
+		}
 		if (!start_worker_by_dboid(dbid))
-			elog(ERROR, "[diskquota launcher] start worker process of database(%u) failed", dbid);
+			elog(ERROR, "[diskquota launcher] start worker process of database(oid:%u) failed", dbid);
 		num++;
 
 		/*
@@ -571,7 +595,10 @@ start_workers_from_dblist(void)
 		 * databases
 		 */
 		if (num >= MAX_NUM_MONITORED_DB)
+		{
+			elog(LOG, "[diskquota launcher] diskquota monitored database limit is reached, database(oid:%u) will not enable diskquota", dbid);
 			break;
+		}
 	}
 	num_db = num;
 	SPI_finish();
@@ -782,7 +809,7 @@ add_dbid_to_database_list(Oid dbid)
 	ret = SPI_execute(str.data, false, 0);
 	if (ret != SPI_OK_INSERT)
 	{
-		elog(ERROR, "[diskquota launcher] SPI_execute sql:'%s', code %d", str.data, ret);
+		elog(ERROR, "[diskquota launcher] SPI_execute sql:'%s', errno:%d", str.data, errno);
 	}
 	return;
 }
@@ -804,7 +831,7 @@ del_dbid_from_database_list(Oid dbid)
 	ret = SPI_execute(str.data, false, 0);
 	if (ret != SPI_OK_DELETE)
 	{
-		elog(ERROR, "[diskquota launcher] SPI_execute sql:'%s', code %d", str.data, ret);
+		elog(ERROR, "[diskquota launcher] SPI_execute sql:'%s', errno:%d", str.data, errno);
 	}
 }
 
@@ -855,6 +882,13 @@ start_worker_by_dboid(Oid dbid)
 	worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
 		BGWORKER_BACKEND_DATABASE_CONNECTION;
 	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+
+	/*
+	 * diskquota worker should not restart by bgworker framework. If
+	 * postmaster reset, all the bgworkers will be terminated and diskquota
+	 * launcher is restarted by postmaster. All the diskquota workers should
+	 * be started by launcher process again.
+	 */
 	worker.bgw_restart_time = BGW_NEVER_RESTART;
 	sprintf(worker.bgw_library_name, "diskquota");
 	sprintf(worker.bgw_function_name, "disk_quota_worker_main");
